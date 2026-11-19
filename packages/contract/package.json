@@ -1,0 +1,26 @@
+{
+  "name": "dsh-psyche-contract",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "心灵套装唯一公共契约：类型、事件名、服务接口、错误码。零运行时依赖。",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json --noEmit"
+  }
+}

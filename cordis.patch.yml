@@ -1,0 +1,9 @@
+- insert:
+    # 这里必须写裸包名，不能写 ./dist/index.js：
+    #   1. 宿主按包根解析裸包名（包根的 index.js 只做转发，见该文件注释）；
+    #   2. 官方 cookbook/adding-a-settings-card.zh.md:58 明确「浏览器半侧只挂在
+    #      说明符恰为裸包名的那一行上」——写成子路径，dsh.client 就不会被加载，
+    #      侧栏面板也就永远出不来。
+    - id: dsh-psyche
+      name: dsh-psyche
+      config: {}

@@ -1,0 +1,10 @@
+# 心灵套装 workspace。P1-1 只建骨架：六个包互不依赖宿主的运行时实现。
+# 注意：根目录 package.json 仍是当前可运行的 dsh-psyche 插件（v0.2.0），
+# 在 Core 接管之前不要把它从 desktop profile 里摘掉。
+packages:
+  - packages/*
+
+# DSH 宿主包（@deepseek-ai/cordis 等）来自 dsh 安装目录，不在公共 npm registry 上。
+# 不要尝试从 registry 自动安装 peer，否则 pnpm 会去 npmjs 找 @deepseek-ai/* 并 404。
+autoInstallPeers: false
+strictPeerDependencies: false

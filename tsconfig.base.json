@@ -1,0 +1,22 @@
+{
+  "//": "workspace 六个包共用的编译基线。根目录的 tsconfig.json 是现有插件自己的配置，刻意不复用，避免互相拖累。",
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "declaration": true,
+    "sourceMap": false,
+    "declarationMap": false,
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "noEmitOnError": true
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "dsh-psyche-pet",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "心灵桌宠通道：只显示 Core 的投影状态（心情/关系/阶段），不拥有记忆。P1-1 骨架。",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "dsh-psyche-contract": "workspace:*",
+    "dsh-psyche-core": "workspace:*"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Psyche",
+    "description": "Single-persona long-term memory core: SQLite as the single source of truth, revisable conclusions, ten psyche_* tools and the ctx.psyche service."
+  }
+}
