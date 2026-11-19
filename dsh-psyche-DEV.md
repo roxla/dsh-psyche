@@ -1,7 +1,7 @@
 # dsh-psyche-DEV — 心灵 · Psyche 设计与迁移基线
 
 版本：v1.0（PSY-M0~M6）
-状态：PSY-M1~M3 已完成；M4 隔离 Host / M5 发布安装待实测。冻结方案见 GPT 评审记录（M01–M10）；迁移报告见 `docs/audit/psy-m1-m3.md`。
+状态：PSY-M1~M3 已完成；M5 干净 clone 构建已通过；M4 隔离 Host 与发布包安装待实测。冻结方案见 GPT 评审记录（M01–M10）；迁移报告见 `docs/audit/psy-m1-m3.md`。
 
 ## 1. 定位
 
@@ -60,5 +60,6 @@ Psyche 是 DeepSeek Harness 的心智系统插件，不是单纯记忆插件。�
 
 - 迁移前基线：5813 断言 / 184 套件 / 185 步 / 0 失败。
 - 迁移后基线：5826 断言 / 185 套件 / 186 步 / 0 失败（`test:all` 通过；含 `product-isolation` 8 与旧来源标记回归 5）。
+- 干净 clone 构建：`pnpm install --frozen-lockfile` 与 `pnpm run build` 通过；`build` 先构建全部 workspace 包，再编译根入口。
 - 真实 Host 安装、侧栏/工具/API、QQ 隔离环境、发布产物：NOT VERIFIED，直到逐项实测。
 - 安全默认值保持：`persona.dominance=false`、群生产回复 DISABLED、Reply Outbox false、Intention Projection false、意识海默认隐藏。

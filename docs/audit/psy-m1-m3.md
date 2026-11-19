@@ -29,11 +29,12 @@
 - 迁移后基线：**5826 断言 / 185 套件 / 186 步 / 0 失败**。
 - 新增：`product-isolation` 8 断言；旧来源标记回归 5 断言（capture-host 2、mood-wiring 2、remember-button 1）。
 - 全量测试包含 12 工具清单、数据门禁、旧标记过滤、备份/恢复、Schema v31 与所有既有回归。
+- 干净 clone 复核：`pnpm install --frozen-lockfile` 成功，`pnpm run build` 通过；期间发现根 `build` 只构建 core、未先构建 contract，干净 clone 会报 `TS2307: Cannot find module 'dsh-psyche-contract'`；已改为先执行 `workspace:build`，再编译根入口。
 
 ## 未完成
 
 - M4 隔离 Host 安装/卸载/客户端页面/工具调用：NOT VERIFIED。
-- M5 干净 clone 构建与发布产物（不依赖 workspace 软链）：NOT VERIFIED。
+- M5 发布产物（npm pack 后不依赖 workspace 软链）与真实安装：NOT VERIFIED；干净 clone 源码构建已 PASS。
 - 真实 QQ 平台与模型行为：NOT VERIFIED；迁移不改变既有 PARTIAL/BLOCKED 结论。
 - Host 认证、生命周期与 Provider 边界仍按内部验证仓的既有结论执行。
 

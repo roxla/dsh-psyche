@@ -37,7 +37,7 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "pnpm --filter dsh-psyche-core run build && tsc -p tsconfig.json && tsc -p tsconfig.client.json",
+    "build": "pnpm run workspace:build && tsc -p tsconfig.json && tsc -p tsconfig.client.json",
     "workspace:build": "pnpm -r --filter \"./packages/*\" run build",
     "workspace:typecheck": "pnpm -r --filter \"./packages/*\" run build && pnpm -r --filter \"./packages/*\" run typecheck",
     "workspace:test": "pnpm -r --filter \"./packages/*\" run test",
