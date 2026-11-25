@@ -17,7 +17,7 @@
 // 测试与诊断脚本读 EXPECTED_TABLE_COUNT 做表数量自检。
 
 /** 当前插件支持的最高 schema 版本；与最后一条 MIGRATIONS 的 version 必须同步。 */
-export const SCHEMA_VERSION = 31
+export const SCHEMA_VERSION = 42
 
 /**
  * v1 建库脚本：33 张表里属于 P1 的 31 张 + 索引 + 只追加触发器 + FTS5 空壳。
@@ -1934,6 +1934,384 @@ CREATE TRIGGER trg_intention_events_no_delete BEFORE DELETE ON intention_events
 BEGIN SELECT RAISE(ABORT, 'intention events are append-only'); END;
 `;
 
+const V32_PROJECT_HANDOFF = `
+-- G1-A：项目交接（跨会话开发记忆）的持久层。
+-- 七张表：projects / project_session_bindings / digest_jobs / session_digests /
+-- project_checkpoints / checkpoint_revisions / checkpoint_references。
+-- 三条设计约束写进库里，而不是靠调用方自觉：
+-- 1) 项目身份用固定 project_id，规范名只作显示名——两个不同根目录都叫 main 是
+--    必须支持的场景，所以不对 (persona_id, canonical_name) 建唯一索引；
+-- 2) 同一逻辑摘要任务重试时复用同一 job_id 并递增 attempts，重放靠
+--    session_digests → digest_jobs → checkpoint_revisions.origin_digest_id 找回
+--    当时提交的修订，即使 head 已经走到更后面；
+-- 3) 证据引用必须真的指向存在的 Source / Digest，且同一条证据对同一事项只登记一次。
+-- 时间口径与 v31 的 sources.captured_at / created_at 一致：ISO 文本，由 nowIso() 生成。
+
+CREATE TABLE projects (
+  project_id      TEXT PRIMARY KEY,
+  persona_id      TEXT NOT NULL REFERENCES persona_config(persona_id),
+  canonical_name  TEXT NOT NULL,
+  workspace_key   TEXT,
+  status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived')),
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  -- 供 project_session_bindings 用复合外键校验「绑定的 persona 必须与项目的 persona 一致」。
+  UNIQUE (project_id, persona_id)
+);
+CREATE UNIQUE INDEX idx_projects_workspace
+  ON projects(persona_id, workspace_key)
+  WHERE workspace_key IS NOT NULL;
+CREATE INDEX idx_projects_status ON projects(persona_id, status);
+
+-- 会话 → 项目的绑定。解绑写 unbound_at 而不是删除，便于审计；
+-- 部分唯一索引保证同一会话同一时刻只有一个活动项目。
+-- committed_to_seq 属于「一次绑定」：解绑后重建会生成新 binding_id，水位从 0 重算，
+-- 旧水位留在旧绑定行上，不回填——两种语义不能混用。
+CREATE TABLE project_session_bindings (
+  binding_id       TEXT PRIMARY KEY,
+  project_id       TEXT NOT NULL,
+  persona_id       TEXT NOT NULL,
+  platform         TEXT NOT NULL,
+  session_ref      TEXT NOT NULL,
+  grant_generation TEXT NOT NULL,
+  committed_to_seq INTEGER NOT NULL DEFAULT 0 CHECK (committed_to_seq >= 0),
+  bound_at         TEXT NOT NULL,
+  unbound_at       TEXT,
+  CHECK (unbound_at IS NULL OR unbound_at >= bound_at),
+  FOREIGN KEY (project_id, persona_id)
+    REFERENCES projects(project_id, persona_id)
+);
+CREATE UNIQUE INDEX idx_bindings_active
+  ON project_session_bindings(persona_id, platform, session_ref)
+  WHERE unbound_at IS NULL;
+CREATE INDEX idx_bindings_project ON project_session_bindings(project_id, bound_at);
+
+-- 摘要任务。项目与会话只经 binding_id 取得，本表不冗余 project_id / session_ref，
+-- 保证同一个 job 只有一份可解释的归属。
+CREATE TABLE digest_jobs (
+  job_id            TEXT PRIMARY KEY,
+  binding_id        TEXT NOT NULL REFERENCES project_session_bindings(binding_id),
+  from_seq          INTEGER NOT NULL,
+  to_seq            INTEGER NOT NULL,
+  algorithm_version TEXT NOT NULL,
+  status            TEXT NOT NULL CHECK (status IN
+                      ('pending','running','succeeded','failed','no_change','cancelled')),
+  attempts          INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  error_code        TEXT,
+  next_retry_at     TEXT,
+  claimed_at        TEXT,
+  finished_at       TEXT,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  CHECK (to_seq >= from_seq AND from_seq >= 1)
+);
+CREATE UNIQUE INDEX ux_digest_jobs_range
+  ON digest_jobs(binding_id, from_seq, to_seq, algorithm_version);
+CREATE INDEX idx_digest_jobs_status ON digest_jobs(status, next_retry_at);
+
+-- 已提交的摘要对象；一个成功 job 最多一条。区间与归属经 job_id 取得。
+-- source_ids_json 是本摘要自身引用的 Source 清单：撤回一条 Source 时才能判断
+-- 哪些派生字段要重算，而不是把整条摘要作废。
+CREATE TABLE session_digests (
+  digest_id       TEXT PRIMARY KEY,
+  job_id          TEXT NOT NULL REFERENCES digest_jobs(job_id),
+  body_json       TEXT NOT NULL,
+  source_ids_json TEXT NOT NULL DEFAULT '[]',
+  created_at      TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_digests_job ON session_digests(job_id);
+CREATE INDEX idx_digests_created ON session_digests(created_at);
+
+-- 每个项目的每个分支一行活动指针。通用进度用预留的非空 branch_key（空串），
+-- 避免 SQLite 的 NULL 唯一性语义在同项目下产生多个「通用指针」。
+-- 复合外键延迟到提交时校验：首次保存可以先插 Checkpoint 再插 revision 1，
+-- 但提交时 head_revision 必须指向真实存在的修订，杜绝空头指针。
+CREATE TABLE project_checkpoints (
+  checkpoint_id TEXT PRIMARY KEY,
+  project_id    TEXT NOT NULL REFERENCES projects(project_id),
+  branch_key    TEXT NOT NULL,
+  head_revision INTEGER NOT NULL,
+  updated_at    TEXT NOT NULL,
+  CHECK (head_revision >= 1),
+  FOREIGN KEY (checkpoint_id, head_revision)
+    REFERENCES checkpoint_revisions(checkpoint_id, revision)
+    DEFERRABLE INITIALLY DEFERRED
+);
+CREATE UNIQUE INDEX idx_checkpoints_branch ON project_checkpoints(project_id, branch_key);
+
+-- 修订只追加：撤回或更正都写新 revision，活动由 head_revision 指向。
+-- 归属由不可改的 checkpoint_id 决定，不冗余 project_id / branch_key。
+-- origin_digest_id 表示「该 Digest 首次产生了本修订」：一个 Digest 顶多领一个
+-- 首修订，但同一 Digest 仍可作为其它修订的证据走 checkpoint_references。
+CREATE TABLE checkpoint_revisions (
+  checkpoint_id     TEXT NOT NULL REFERENCES project_checkpoints(checkpoint_id),
+  revision          INTEGER NOT NULL,
+  repo_ref          TEXT,
+  last_active_at    TEXT,
+  current_goal      TEXT,
+  completed_json    TEXT NOT NULL DEFAULT '[]',
+  blockers_json     TEXT NOT NULL DEFAULT '[]',
+  next_steps_json   TEXT NOT NULL DEFAULT '[]',
+  dependencies_json TEXT NOT NULL DEFAULT '[]',
+  decisions_json    TEXT NOT NULL DEFAULT '[]',
+  confidence        TEXT NOT NULL DEFAULT 'medium' CHECK (confidence IN ('low','medium','high')),
+  generator         TEXT NOT NULL,
+  origin_digest_id  TEXT REFERENCES session_digests(digest_id),
+  created_at        TEXT NOT NULL,
+  PRIMARY KEY (checkpoint_id, revision),
+  CHECK (revision >= 1)
+);
+CREATE UNIQUE INDEX ux_revision_origin_digest
+  ON checkpoint_revisions(origin_digest_id)
+  WHERE origin_digest_id IS NOT NULL;
+
+CREATE TRIGGER trg_checkpoint_revisions_no_update BEFORE UPDATE ON checkpoint_revisions
+BEGIN SELECT RAISE(ABORT, 'checkpoint revisions are append-only'); END;
+CREATE TRIGGER trg_checkpoint_revisions_no_delete BEFORE DELETE ON checkpoint_revisions
+BEGIN SELECT RAISE(ABORT, 'checkpoint revisions are append-only'); END;
+
+-- 证据引用绑定到具体修订。source_id 与 digest_id 恰有一个非空：一条引用要么指向
+-- 原话，要么指向摘要，不能同时两者（否则撤回时二义）。
+-- item_key 标识这条证据支撑的是哪个事项（例如 U-017）：同一事项重复登记同一来源
+-- 会被部分唯一索引拒绝，不同事项引用同一来源则合法。
+-- 注意：外键存在只证明行存在，不证明当前可读——Brief 读取仍须自行判定撤回/软删。
+-- 不用 artifact_relations：那是 Artifact→Artifact 的关系表，端点是 Artifact。
+CREATE TABLE checkpoint_references (
+  ref_id        INTEGER PRIMARY KEY,
+  checkpoint_id TEXT NOT NULL,
+  revision      INTEGER NOT NULL,
+  item_key      TEXT NOT NULL CHECK (length(trim(item_key)) > 0),
+  source_id     TEXT REFERENCES sources(source_id),
+  digest_id     TEXT REFERENCES session_digests(digest_id),
+  created_at    TEXT NOT NULL,
+  FOREIGN KEY (checkpoint_id, revision)
+    REFERENCES checkpoint_revisions(checkpoint_id, revision),
+  CHECK ((source_id IS NOT NULL) <> (digest_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX ux_checkpoint_item_source
+  ON checkpoint_references(checkpoint_id, revision, item_key, source_id)
+  WHERE source_id IS NOT NULL;
+CREATE UNIQUE INDEX ux_checkpoint_item_digest
+  ON checkpoint_references(checkpoint_id, revision, item_key, digest_id)
+  WHERE digest_id IS NOT NULL;
+CREATE INDEX idx_references_revision ON checkpoint_references(checkpoint_id, revision);
+CREATE INDEX idx_references_source ON checkpoint_references(source_id) WHERE source_id IS NOT NULL;
+CREATE INDEX idx_references_digest ON checkpoint_references(digest_id) WHERE digest_id IS NOT NULL;
+
+CREATE TRIGGER trg_checkpoint_references_no_update BEFORE UPDATE ON checkpoint_references
+BEGIN SELECT RAISE(ABORT, 'checkpoint references are append-only'); END;
+CREATE TRIGGER trg_checkpoint_references_no_delete BEFORE DELETE ON checkpoint_references
+BEGIN SELECT RAISE(ABORT, 'checkpoint references are append-only'); END;
+`;
+
+const V33_DIGEST_JOB_MODE = `
+-- G1-A 修正：手动保存与自动摘要的唯一性口径不能共用。
+-- v32 把「证据条数」当成「连续处理了几个位置」（from_seq = 水位+1，to_seq = 水位+证据数），
+-- 三个反例证伪了这条推算：
+--   1) 零证据时 Math.max(0,1) 凭空推进一格水位；
+--   2) 重复选同一条来源时区间相同，第二次被当成重放；
+--   3) 跳选非连续来源时区间永远推不动（fromSeq > committed+1），之后再也存不进去。
+-- 根因是手动保存没有可重放的请求标识，却借用了自动摘要的区间概念来构造唯一键。
+-- 这一版把两类任务分开：
+--   mode='range'  有稳定 toSeq 的连续区间，唯一性按区间；
+--   mode='manual' 只有一次请求，唯一性按 request_id，区间只记录保存时刻的水位位置。
+-- SQLite 不能在事务里关 foreign_keys，所以不重建表（重建会牵动 session_digests →
+-- checkpoint_revisions / checkpoint_references 整条链）；改为加列 + 换索引。
+
+ALTER TABLE digest_jobs ADD COLUMN mode TEXT NOT NULL DEFAULT 'range'
+  CHECK (mode IN ('range','manual'));
+-- 手动任务的请求标识：一次草稿一个，双击重放靠它，不靠内容。
+ALTER TABLE digest_jobs ADD COLUMN request_id TEXT;
+-- 手动任务的内容校验：目标分支、规范正文、事实与去重后的证据引用。
+-- 同一 request_id 但内容不同要拒绝，而不是悄悄写第二条。
+ALTER TABLE digest_jobs ADD COLUMN payload_hash TEXT;
+
+DROP INDEX ux_digest_jobs_range;
+-- 区间唯一性只管 range 任务：手动任务的 from_seq/to_seq 是水位位置，不代表处理进度。
+CREATE UNIQUE INDEX ux_digest_jobs_range
+  ON digest_jobs(binding_id, from_seq, to_seq, algorithm_version)
+  WHERE mode = 'range';
+CREATE UNIQUE INDEX ux_digest_jobs_request
+  ON digest_jobs(binding_id, request_id)
+  WHERE mode = 'manual' AND request_id IS NOT NULL;
+`;
+
+// G5 提醒登记：用户说「十分钟后提醒我喝水」这种**用户明确要办的事**。
+//
+// 为什么不复用 intentions：那张表是「心灵自己的意愿」，语义与这里相反。
+// 它有 type / reason_code / reevaluate_at 与**必填的 expires_at**，没有 kind
+// 与 due_at；状态限于 internal / deferred / abandoned / expired；attention_id
+// 与 score 也必填；semantic_key 的唯一约束只覆盖前两种状态。
+// 拿它存用户承诺会把「重新评估意愿的时间」当成「用户要的提醒时间」，
+// 而且到期后无法表达「已送达」。
+//
+// 这张表只做**登记、查询、取消**三件事：到期派发留在下一批，
+// 所以这里没有 outbox_id，只有派发状态位与最后一次尝试时间。
+// v35：离线回复队列记住「这条回复是哪个授权代次下开工的」。
+//
+// 12a 只在内存里比代次，跨重启就丢——重启后一条撤销前入队的回复会因为「当前名单
+// 里有他」被放出去。这一列把准入时刻的代次写进任务本身。
+//
+// 用可空表示「迁移前写入、没有快照」：那批行**不补当前代次**，恢复时按缺失处理并
+// 停止自动发送（补上一律等于默认授权，而默认授权正是要防的那件事）。
+const V35_REPLY_ACCESS_EPOCH = `
+ALTER TABLE qq_reply_outbox ADD COLUMN access_epoch INTEGER;
+`;
+
+// v36：策略侧持久化「每个授权对象当前是第几代」。
+//
+// v35 只把代次写进了任务行，桥接自己那份 `#accessEpochs` 仍是内存的——重启后从 0
+// 重新计数，而库里的 `access_epoch` 可能是 2 或 3，于是重启后所有在途回复都被判
+// `access-superseded`。比误发安全，但会让重启后的回复静默失败。
+//
+// 键是 `peer_key`（`private:<userId>` / `group:<groupId>`）加 persona，与桥接的
+// Map 同构；`epoch` 只增不减，撤销后保留记录，重新加回来继续往上走。
+const V36_ACCESS_EPOCHS = `
+CREATE TABLE access_epochs (
+  persona_id TEXT NOT NULL REFERENCES persona_config(persona_id),
+  peer_key TEXT NOT NULL CHECK (length(peer_key) > 0),
+  epoch INTEGER NOT NULL CHECK (epoch >= 0),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (persona_id, peer_key)
+);
+`;
+
+// v37：授权代次的两阶段提交（先记「打算涨到几」，再改名单，最后确认）。
+//
+// 为什么单靠 v36 不够：名单写覆盖文件、代次写 SQLite，两个位置不是同一时刻落盘。
+// 崩溃点落在「覆盖文件已写、代次还没落库」时，重启后读到的组合是「名单里有人 +
+// 代次还是旧的」——如果这中间发生过「撤销 → 重新授权」，那个旧代次恰好又变成合法值，
+// 于是撤销前开工的任务会恢复发送资格。这不是偏保守，是放行。
+//
+// 所以变更分三步，每一步都能在重启后判定：
+//   1. 先往这张表写「哪些 peer 打算涨到几代」（pending）；
+//   2. 写覆盖文件；
+//   3. 事务里提交 access_epochs 并删掉对应的 pending 行。
+// 重启时只要 pending 里还有某 peer，就说明第 3 步没完成——那时**不猜**它到底该是多少，
+// 直接把这个对象暂停派遣，等人重新授权一次（那次会走完整流程并清掉 pending）。
+//
+// `target_epoch` 记下来的用途是诊断：它告诉运维「上次想涨到哪」，不参与放行判定。
+/**
+ * 提醒行要记住「登记那一刻的授权代次」。
+ *
+ * 不加就有一个真实漏洞：登记 → 撤权 → 重新授权 → 到期，
+ * 旧提醒在扫描时才去读当前代次，会拿到**新**代次，于是撤权拦不住它。
+ * 代次必须在登记时定下来，到期时按原样复制。
+ *
+ * 可空同理：迁移前登记的提醒没有快照，不补当前值（补上等于默认授权），
+ * 入队时按「没有凭据」处理、worker 停发。
+ */
+const V39_REMINDER_ACCESS_EPOCH = `
+ALTER TABLE reminders ADD COLUMN access_epoch INTEGER;
+`
+
+// 第 53 轮外部评审 P1-A：队列行必须能反查到提醒，否则「已取消的提醒不被发送」
+// 与「投递终态回写提醒」都无处落账。可空是刻意的：普通对话回复没有提醒。
+const V40_REPLY_REMINDER_LINK = `
+ALTER TABLE qq_reply_outbox ADD COLUMN reminder_id TEXT;
+
+-- 一条提醒最多一条队列行：重扫描/重启重放都落到同一行上。
+-- 第 53 轮 P1-A 修正：身份是 (persona_id, reminder_id)，不是裸 reminder_id——
+-- 不同 Persona 各自有独立的提醒命名空间，单列唯一会在跨 Persona 时误伤。
+CREATE UNIQUE INDEX idx_qq_reply_outbox_reminder ON qq_reply_outbox (persona_id, reminder_id)
+  WHERE reminder_id IS NOT NULL;
+
+-- delivery_state 的 CHECK 只有 unsupported/pending/sent/unknown，表达不了
+-- 「确定发送失败」。加一列记终态结果，避免重建表；NULL 表示还没有终态。
+-- 允许值与 status 的对应：sent → status='fired'；failed → status='failed'；
+-- unknown → status 仍是 'pending'（不知道发没发出去，不能算失败）。
+ALTER TABLE reminders ADD COLUMN delivery_result TEXT
+  CHECK (delivery_result IS NULL OR delivery_result IN ('sent', 'failed', 'unknown'));
+`
+
+// 第 56 轮 P1-B：提醒撞上「允许回复时段」时不能判死，只能延后。
+// `due_at` 保留原定时间（用户设的提醒，时间不能被改写），另外用一列记「下一次可以试」。
+// NULL 表示没有延后过。队列行侧的同一语义复用已有的 retry_at。
+const V41_REMINDER_NEXT_ATTEMPT = `
+ALTER TABLE reminders ADD COLUMN next_attempt_at TEXT;
+`
+
+// 第 57 轮 P1-C：人工裁决要有证据表，不能只改状态了事。
+// 第 16 轮评审点名的两件事靠它成立：
+//   ①「裁决人、裁决时间、结论」必须有落账位置（`terminal_at` 是「进入终态的时刻」，
+//     过期行早就有了它，不能拿它冒充本次裁决时间）；
+//   ② 同一条队列行只能被裁决一次——`reply_id` 做主键，第二个写入者直接撞约束回滚，
+//     所以「两个相反裁决只有一个成功」是数据库保证的，不是靠先查后写。
+// `reminder_id` 可空：普通对话回复没有提醒，但它同样可能落 unknown。
+const V42_REPLY_VERDICTS = `
+CREATE TABLE qq_reply_verdicts (
+ reply_id TEXT PRIMARY KEY REFERENCES qq_reply_outbox(reply_id) ON DELETE CASCADE,
+ reminder_id TEXT,
+ persona_id TEXT NOT NULL,
+ verdict TEXT NOT NULL CHECK(verdict IN ('received', 'not-received')),
+ decided_by TEXT NOT NULL,
+ decided_at TEXT NOT NULL
+);
+CREATE INDEX idx_qq_reply_verdicts_reminder ON qq_reply_verdicts(reminder_id);
+`
+
+const V38_SOURCE_TURN = `
+-- 第 45 轮外部评审 Q1：摘要的「有效轮」要按轮次身份数，不能数发言条数。
+-- 一轮里可能有多条用户消息（补一句、再补一句），也可能一条回复都没有
+-- （模型失败、被撤权拦下），按条数算会导致「永远凑不齐 8 轮」或「8 条消息当 8 轮」。
+-- 可空是刻意的：迁移前的历史 Source 没有轮次身份，读侧按 NULL 处理而不是猜。
+ALTER TABLE sources ADD COLUMN turn_id TEXT;
+
+-- 同一会话同一轮只该有一条用户正文与一条助手正文参与计数，但这里不建唯一索引：
+-- 一轮里合法地可以有多条 Source（发送两张图、一次拆成两句），
+-- 只在查询时按 turn_id 分组去重。
+CREATE INDEX idx_sources_turn ON sources (session_ref, turn_id)
+  WHERE turn_id IS NOT NULL;
+`;
+
+const V37_ACCESS_EPOCH_PENDING = `
+CREATE TABLE access_epoch_pending (
+  persona_id TEXT NOT NULL REFERENCES persona_config(persona_id),
+  peer_key TEXT NOT NULL CHECK (length(peer_key) > 0),
+  target_epoch INTEGER NOT NULL CHECK (target_epoch >= 0),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (persona_id, peer_key)
+);
+`;
+
+const V34_REMINDERS = `
+CREATE TABLE reminders (
+  reminder_id     TEXT NOT NULL PRIMARY KEY,
+  persona_id      TEXT NOT NULL REFERENCES persona_config(persona_id),
+  -- 谁要这个提醒。私聊按联系人，桌面会话按 stable_user_id；两者都可能为空，
+  -- 空表示「这个接收者没有可归属的身份」，查询与派发都必须拒绝（fail-closed）。
+  channel         TEXT NOT NULL CHECK (channel IN ('desktop','qq')),
+  contact_id      TEXT REFERENCES contacts(contact_id),
+  session_ref     TEXT,
+  -- 用户原话里的时间被解析后的绝对时刻（ISO 文本，与全库一致）。
+  due_at          TEXT NOT NULL,
+  -- 解析时用的时区，派发时按它复核「现在到了没有」，避免跨时区提前/延后。
+  timezone        TEXT NOT NULL,
+  text            TEXT NOT NULL CHECK (length(trim(text)) > 0),
+  -- 幂等键：同一次用户请求重放要返回同一个 reminder_id，不新增行。
+  request_id      TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','cancelled','fired','failed')),
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  cancelled_at    TEXT,
+  fired_at        TEXT,
+  -- 派发尚不通时记 'unsupported'，界面据此显示「已登记，自动发送尚未启用」。
+  delivery_state  TEXT NOT NULL DEFAULT 'unsupported'
+                    CHECK (delivery_state IN ('unsupported','pending','sent','unknown')),
+  last_attempt_at TEXT
+);
+
+-- 同一次请求只能登记一条：双击、重试、网络重发都落到同一行。
+CREATE UNIQUE INDEX ux_reminders_request ON reminders(persona_id, request_id);
+-- 到期扫描走这条：只要 pending 且到点的。
+CREATE INDEX idx_reminders_due ON reminders(status, due_at)
+  WHERE status = 'pending';
+-- 「我的提醒」列表按接收者查。
+CREATE INDEX idx_reminders_owner ON reminders(persona_id, channel, contact_id, created_at);
+`;
+
+
 export const MIGRATIONS: readonly Migration[] = Object.freeze([
   {
     version: 1,
@@ -2075,6 +2453,17 @@ export const MIGRATIONS: readonly Migration[] = Object.freeze([
   { version: 29, name: 'growth-reflection-budget', sql: V29_GROWTH_REFLECTION_BUDGET },
   { version: 30, name: 'external-source-erase-events', sql: V30_EXTERNAL_SOURCE_ERASE },
   { version: 31, name: 'intention', sql: V31_INTENTION },
+  { version: 32, name: 'project-handoff', sql: V32_PROJECT_HANDOFF },
+  { version: 33, name: 'digest-job-mode', sql: V33_DIGEST_JOB_MODE },
+  { version: 34, name: 'reminders', sql: V34_REMINDERS },
+  { version: 35, name: 'reply-access-epoch', sql: V35_REPLY_ACCESS_EPOCH },
+  { version: 36, name: 'access-epochs', sql: V36_ACCESS_EPOCHS },
+  { version: 37, name: 'access-epoch-pending', sql: V37_ACCESS_EPOCH_PENDING },
+  { version: 38, name: 'source-turn', sql: V38_SOURCE_TURN },
+  { version: 39, name: 'reminder-access-epoch', sql: V39_REMINDER_ACCESS_EPOCH },
+  { version: 40, name: 'reply-reminder-link', sql: V40_REPLY_REMINDER_LINK },
+  { version: 41, name: 'reminder-next-attempt', sql: V41_REMINDER_NEXT_ATTEMPT },
+  { version: 42, name: 'reply-verdicts', sql: V42_REPLY_VERDICTS },
 ])
 
 // 表数量自检：v1 三十一张 + v2 的 phase_milestones / learning_jobs + v3 的 admission_observations
@@ -2088,9 +2477,12 @@ export const MIGRATIONS: readonly Migration[] = Object.freeze([
 // + v27 的 memory_merge_events / memory_archive_events 记忆整理与淡忘事件
 // + v28 的 external_sources / external_source_deletion_events 外界来源登记与删除事件
 // + v29 的 growth_reflection_processed_sources 逐条 Source 已处理账本（另给 growth_reflections 加 source_ids 列）
+// + v32 的七张项目交接表（projects / project_session_bindings / digest_jobs /
+//   session_digests / project_checkpoints / checkpoint_revisions / checkpoint_references）
+// + v42 的 qq_reply_verdicts 人工裁决证据表（裁决人 / 时间 / 结论，一条队列行只能被裁决一次）
 // （v4/v6/v8/v9/v10/v13/v14/v17 只加列或只加索引，不加表；v18 另给 decision_runs 加 result_diary_id 列）。
 // 自检用的是「新建一个空库后数 sqlite_master」这条路（adapter.tableCount），
 // 所以这个常量是「结构断言」而不是「数据统计」：迁移里多建/少建一张表都会被它发现。
 // 注意别把 FTS5 的影子表（fts_index_*）算进来，tableCount() 已经把它们排除了。
-export const EXPECTED_TABLE_COUNT = 70
+export const EXPECTED_TABLE_COUNT = 81
 

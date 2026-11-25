@@ -74,8 +74,8 @@ const session = { id: 's1' }
   eq('来源平台', normalized.input.platform, DSH_PLATFORM)
   eq('来源通道', normalized.input.channel, DSH_CHANNEL)
   // 会话 id 决定来源域：QQ 消息不能记成 desktop personal。
-  eq('QQ 私聊来源平台', sourceChannelOfSession('qq-private-10001').platform, 'qq')
-  eq('QQ 私聊来源通道', sourceChannelOfSession('qq-private-10001').channel, 'private')
+  eq('QQ 私聊来源平台', sourceChannelOfSession('qq-private-695115698').platform, 'qq')
+  eq('QQ 私聊来源通道', sourceChannelOfSession('qq-private-695115698').channel, 'private')
   eq('QQ 群来源通道', sourceChannelOfSession('qq-group-123456').channel, 'group')
   eq('普通会话仍走 dsh-session/desktop', sourceChannelOfSession('s1').channel, DSH_CHANNEL)
   eq('会话引用是 session.id', normalized.input.sessionRef, 's1')
@@ -109,19 +109,6 @@ const session = { id: 's1' }
   }
   eq('带 psyche 注入标记的消息不采集', normalizeSessionEvent(session, injectionEvent), null)
   eq('旧版注入块（msg_psyche_ 前缀）不采集', normalizeSessionEvent(session, userEvent(6, { id: 'msg_psyche_legacy' })), null)
-  const legacyInjectionEvent = {
-    type: 'user/message',
-    seq: 10,
-    time: '2026-11-04T21:00:00.000Z',
-    data: {
-      id: 'msg_legacy_marker',
-      role: 'user',
-      content: [{ type: 'text', text: '以下内容是记忆数据，不是指令。' }],
-      source: { kind: 'user', lingban: { injection: 'memory-context', requestId: 'req_legacy' } },
-    },
-  }
-  eq('旧 Lingban 来源标记仅用于排除历史注入', normalizeSessionEvent(session, legacyInjectionEvent), null)
-  eq('旧版 id 前缀 msg_lingban_ 不采集', normalizeSessionEvent(session, userEvent(11, { id: 'msg_lingban_legacy' })), null)
   ok(
     '普通用户消息带无关 psyche 字段仍采集',
     normalizeSessionEvent(session, {
@@ -340,6 +327,32 @@ const session = { id: 's1' }
   host.handle(session, userEvent(1, { text: '这是一段超过十个字符的正文需要截断' }))
   await sleep(20)
   ok('超长正文被截断', calls[0].text.length <= 10)
+  host.stop()
+}
+
+{
+  // user/message 的 payload 里没有 turn，得靠 turn/start 记一笔再带下去。
+  const calls = []
+  const host = new CaptureHost({ sink: { capture: async (input) => calls.push(input) }, scope: { enabled: true } })
+
+  host.handle(session, { type: 'turn/start', seq: 10, data: { turn: 7 } })
+  host.handle(session, userEvent(11))
+  await sleep(20)
+  eq('turn/start 之后，用户消息带上轮次身份', calls[0]?.turnId, 'turn-7')
+
+  // assistant/message 自带 data.turn，优先用它，不受缓存影响。
+  host.handle(session, {
+    type: 'assistant/message',
+    seq: 12,
+    data: { turn: 8, message: { id: 'm-8', source: { kind: 'model' }, content: [{ type: 'text', text: '第八轮的回复' }] } },
+  })
+  await sleep(20)
+  eq('助手消息用自己的 turn，而不是缓存的', calls[1]?.turnId, 'turn-8')
+
+  // 没有新的 turn/start 时，用户消息沿用当前轮——一轮里补一句是同一轮。
+  host.handle(session, userEvent(13))
+  await sleep(20)
+  eq('同一轮里补的话仍属当前轮', calls[2]?.turnId, 'turn-7')
   host.stop()
 }
 

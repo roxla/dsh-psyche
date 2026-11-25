@@ -1,4 +1,4 @@
-// C2-B：注入消息与 pre-step 回执的关联键（runId）、会话/轮次范围字段。
+﻿// C2-B：注入消息与 pre-step 回执的关联键（runId）、会话/轮次范围字段。
 //
 // 验收口径（用户 m29573）：
 // - v14 只加 session_ref / turn，旧记录保持 NULL；
@@ -94,7 +94,7 @@ function userMessage(text: string): PreStepMessage[] {
 
 // ── C2L-01：v14 迁移与列 ───────────────────────────────────────────────
 const version = db.get('PRAGMA user_version')
-eq('user_version=31', Number(version?.user_version), 31)
+eq('user_version=42', Number(version?.user_version), 42)
 const columns = db.all('PRAGMA table_info(recall_runs)').map((row) => String(row.name))
 ok('recall_runs 有 session_ref', columns.includes('session_ref'))
 ok('recall_runs 有 turn', columns.includes('turn'))

@@ -42,6 +42,7 @@ export type { GroupCommand, GroupMember, GroupBatch } from './group-scheduling.j
 export { groupProjection, groupMemberText, groupProjectionHash, GROUP_PROJECTION_VERSION } from './group-scheduling.js'
 export * from './relationship.js'
 export * from './contact-affect.js'
+export * from './relationship-ingest.js'
 export * from './contact-trust.js'
 // P3-B-3：关系投影（纯函数；只输出一行受控文本，不写库）与独立 Prompt Context。
 export * from './relationship-projection.js'
@@ -161,6 +162,11 @@ export type {
 export * from './intention-choice.js'
 export * from './intention-projection.js'
 export * from './intention-store.js'
+export * from './project-handoff-store.js'
+export * from './reminders.js'
+export * from './reminder-outbox.js'
+export * from './session-digest.js'
+export * from './access-epochs.js'
 
 export const name = 'dsh-psyche-core'
 

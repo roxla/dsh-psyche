@@ -1,4 +1,4 @@
-// 心灵的工具定义（设计 §9.1）：读写混合，现共十二个。
+// 心灵的工具定义（设计 §9.1）：五个写、五个只读，v14 又补了 psyche_context，现共十一个。
 //
 // 职责：把 Core 的方法包装成宿主认识的 ToolDefinition——parameter/description 写给模型看，
 //   render 把结构化结果翻成人话文本，execute 只做转发。这里不做业务判断。
@@ -12,6 +12,7 @@ import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/cordis'
 import { jsonSafe, toErrorPayload } from './errors.js'
 import { formatDateTime } from './time.js'
+import { NO_REPLY_WINDOW_AT } from './reminder-delivery.js'
 import { INTERACTION_TYPES, KIND_STATES } from './store.js'
 import { looksSensitive } from './sensitive.js'
 import type {
@@ -80,6 +81,136 @@ type FetchResult = Awaited<ReturnType<Core['fetch']>>
 type ContextResult = Awaited<ReturnType<Core['context']>>
 
 /**
+ * 提醒在工具层的视图：只暴露模型需要判断的字段。
+ * 刻意不带 persona_id / request_id / session_ref —— 那些是内部记账，
+ * 模型看到只会把它们当成可引用的内容。
+ */
+export interface ReminderView {
+  reminderId: string
+  dueAt: string
+  text: string
+  status: string
+  deliveryState: string
+  createdAt: string
+  /**
+   * P1-E：投递通道。`desktop` 没有自动投递能力，历史上的这类行只当记录留着。
+   */
+  channel?: 'desktop' | 'qq'
+  /**
+   * P1-B：撞上安静时段时记下的「下次可尝试时刻」。
+   * `null` = 没有延后；等于 `NO_REPLY_WINDOW_AT` = 暂无可用时段（规则暂停或八天内无窗口）。
+   */
+  nextAttemptAt?: string | null
+}
+
+/**
+ * P1-B：把「已延后」说清楚。
+ *
+ * 用户设的时间（`dueAt`）与真正可能发出的时间（`nextAttemptAt`）不是一回事，
+ * 尤其是落在对方安静时段时——只报原定时间会让用户以为已经发过了。
+ */
+export function deferredNote(r: ReminderView): string {
+  if (typeof r.nextAttemptAt !== 'string' || r.nextAttemptAt.length === 0) return ''
+  if (r.nextAttemptAt === NO_REPLY_WINDOW_AT) {
+    return `\n已延后：原定 ${formatDateTime(r.dueAt)}，暂无可用时段（规则暂停或八天内没有窗口），规则恢复后会重新排队。`
+  }
+  return `\n已延后：原定 ${formatDateTime(r.dueAt)}，预计最早 ${formatDateTime(r.nextAttemptAt)}。`
+}
+
+/**
+ * P1-C：`pending/unknown/unknown` 的提醒既不会自动重发，也不会被普通取消改掉——
+ * 它必须让 Owner 看得见、裁得了。这两个小函数是「看得见」的一半（另一半是卡片计数）。
+ */
+export function isAwaitingVerdict(r: ReminderView): boolean {
+  return r.status === 'pending' && r.deliveryState === 'unknown'
+}
+
+/** 列表里的投递状态：不能把「结果不确定」显示成普通人眼里的「待办」。 */
+export function reminderStateText(r: ReminderView): string {
+  if (isAwaitingVerdict(r)) return '结果不确定（待裁决）'
+  // 取消是终态，渠道不改变它的说法：桌面历史行取消后必须看得出「已取消」。
+  if (r.status === 'cancelled') return '已取消'
+  // 第 57 轮 P1-E：只有「还在等待、而且桌面没有自动投递通道」的历史行才挂这句；
+  // 不能只按 channel 判断，否则取消后的行仍显示「桌面不支持自动发送」，像是没取消成功。
+  // NULL 在视图里可能以 'null' 字符串、null 或 undefined 出现，四种形态都算「没有通道」。
+  const rawState: unknown = r.deliveryState
+  const desktopNoChannel = rawState === 'unsupported' || rawState === 'null' ||
+    rawState === null || rawState === undefined
+  if (r.channel === 'desktop' && r.status === 'pending' && desktopNoChannel) {
+    return '历史记录·桌面不支持自动发送'
+  }
+  if (r.status === 'pending' && r.deliveryState === 'pending') return '已入队'
+  return r.status
+}
+
+export interface CreateReminderResult {
+  ok: boolean
+  status: 'created' | 'replayed' | 'no-receiver' | 'bad-due' | 'empty-text' | 'unsupported-channel'
+  reminder?: ReminderView
+  reason?: string
+}
+
+export interface ListRemindersResult {
+  ok: boolean
+  items: ReminderView[]
+  total: number
+}
+
+export interface CancelReminderResult {
+  ok: boolean
+  /**
+   * `in-flight`：已经被 Worker 领取，消息可能已经在路上，取消无法确认。
+   * `unknown`：上次投递结果不确定，只有 Owner 人工裁决能定，普通取消改不动。
+   * 这两个都不是「已撤销」，渲染时必须说清。
+   */
+  status: 'cancelled' | 'replayed' | 'not-found' | 'no-permission' | 'in-flight' | 'unknown'
+  reminder?: ReminderView
+}
+
+/**
+ * P1-C：`unknown` 的人工裁决结果。
+ *
+ * 只有 Owner 能裁决；`received` 落 `fired/sent/sent`，`not-received` 落
+ * `failed/unsupported/failed`——**两种都不重发**。`not-found` / `conflict` 是零写入，
+ * 渲染时不能说「已经改了」。
+ */
+export interface ResolveDeliveryResult {
+  ok: boolean
+  status: 'resolved' | 'not-found' | 'conflict' | 'no-permission' | 'unavailable'
+  replyId?: string
+  reason?: string
+}
+
+/** 接收者由宿主从会话绑定推出来，模型参数进不到这里。 */
+export interface ReminderScope {
+  channel: 'desktop' | 'qq'
+  contactId?: string | null
+  sessionRef?: string | null
+}
+
+/** 待确认的成长候选。`hash` 是用户看到的那一版，决定时要原样带回来。 */
+export interface GrowthCandidateItem {
+  candidateId: string
+  type: string
+  statement: string
+  independentCount: number
+  hash: string
+}
+
+export interface GrowthCandidatesResult {
+  ok: boolean
+  total: number
+  items: GrowthCandidateItem[]
+}
+
+export interface GrowthDecideResult {
+  ok: boolean
+  decision: 'confirm' | 'reject' | 'withdraw'
+  candidateId: string
+  idempotent: boolean
+}
+
+/**
  * 工具层只依赖这十二个方法（写 6 + 读 6），不关心 Core 是直接给的还是等 boot 之后才有的。
  * index.ts 传进来的桥接对象会先 await ready 再转发，签名保持一致。
  * 注意：这里刻意用 Core['x'] 而不是自定义接口，改 Core 签名时这里跟着变，不会出现「工具层以为还能调」。
@@ -97,6 +228,35 @@ export interface ToolsCore {
   recall: Core['recall']
   fetch: Core['fetch']
   context: Core['context']
+  /** G5：三个提醒动作。接收者由 index.ts 从会话绑定注入，签名里显式要求。 */
+  createReminder: (input: {
+    dueAt: string
+    timezone: string
+    text: string
+    requestId: string
+    now: string
+    receiver: ReminderScope | null
+  }) => Promise<CreateReminderResult>
+  listReminders: (limit: number | undefined, receiver: ReminderScope | null) => Promise<ListRemindersResult>
+  cancelReminder: (
+    reminderId: string,
+    now: string,
+    receiver: ReminderScope | null,
+  ) => Promise<CancelReminderResult>
+  /** P1-C：把「结果不确定」的提醒裁决成 received / not-received。Owner only，两种都不重发。 */
+  resolveReminderDelivery: (input: {
+    reminderId: string
+    verdict: 'received' | 'not-received'
+    now: string
+    receiver: ReminderScope | null
+  }) => Promise<ResolveDeliveryResult>
+  /** 人格成长：先看候选、再决定。确认之后这条才会进投影。 */
+  growthCandidates: (limit?: number) => Promise<GrowthCandidatesResult>
+  growthDecide: (
+    candidateId: string,
+    decision: string,
+    hash: string,
+  ) => Promise<GrowthDecideResult>
 }
 
 /**
@@ -187,7 +347,7 @@ function defineTool<T>(definition: ToolDefinition<T>): ToolDefinition<T> {
 }
 
 /**
- * 构造心灵全部 12 个工具定义。
+ * 构造心灵全部 11 个工具定义。
  * 参数 core：Core 的桥接对象（index.ts 传「先 await ready」的版本）。
  * 参数 options.recallScope：从宿主工具执行上下文里取**可信** Recall Scope（R3）。
  *   只允许读 RuntimeInputStore 的会话绑定；模型传参一律进不到这里。
@@ -197,7 +357,11 @@ function defineTool<T>(definition: ToolDefinition<T>): ToolDefinition<T> {
  */
 export function buildTools(
   core: ToolsCore,
-  options: { recallScope?: (exec: unknown) => RecallScope } = {},
+  options: {
+    recallScope?: (exec: unknown) => RecallScope
+    /** G5：提醒的接收者，同样只来自宿主会话绑定，模型参数进不到这里。 */
+    reminderScope?: (exec: unknown) => ReminderScope | null
+  } = {},
 ): unknown[] {
   // 先按名字挂到中间对象上再按固定顺序返回：这样上面定义顺序可以自由排（写完再写读），
   // 而工具表顺序仍由最后那个数组决定，两者不互相绑架。
@@ -709,6 +873,274 @@ export function buildTools(
     }),
   })
 
+  // G5 提醒登记：用户明确让他「到点提醒我」时用。
+  // 只做登记，不承诺送达——deliveryState 为 unsupported 时必须说破，
+  // 否则用户会以为手机真的会响。
+  tools.createReminder = defineTool<CreateReminderResult>({
+    name: 'psyche_create_reminder',
+    description:
+      '登记一条到点提醒。用户说「十分钟后提醒我喝水」「明天九点叫我」这类**明确要办的事**时用它。' +
+      '必须给出绝对时刻(due_at)或相对分钟数(in_minutes)，二选一。' +
+      '登记成功只代表记下了；QQ 会话里的提醒到点会按允许回复时段尝试发送，撞上安静时段会延后，不会丢掉。' +
+      '桌面会话没有自动投递通道，会直接拒绝登记并说明「本次未登记」，不要假装已经安排好了。' +
+      '同一个请求重放会返回同一个 reminderId，不会重复登记。',
+    parameters: {
+      text: { type: 'string', description: '提醒内容，用用户的原话' },
+      in_minutes: { type: 'number', description: '相对分钟数（与 due_at 二选一）' },
+      due_at: { type: 'string', description: '绝对时刻，ISO UTC，例 2026-11-22T05:30:00.000Z' },
+      timezone: { type: 'string', description: '时区，默认 Asia/Shanghai' },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => {
+        const fail = failed(value)
+        if (fail) return fail
+        // 第 57 轮 P1-E：桌面没有投递通道，入口就拒，别留下「登记了会发」的错觉。
+        if (value.status === 'unsupported-channel') {
+          return [{ type: 'text', text: '当前不支持桌面自动提醒，本次未登记。' }]
+        }
+        if (!value.reminder) {
+          return [{ type: 'text', text: `没有登记：${value.reason ?? value.status}` }]
+        }
+        const r = value.reminder
+        const head = value.status === 'replayed' ? '这条提醒之前已经登记过。' : '已登记。'
+        const when = `${formatDateTime(r.dueAt)}（${r.status}）`
+        // 第 57 轮 P1-E：`delivery_state='unsupported'` 在 QQ 提醒上表示「等待入队」，
+        // 不是「没有投递能力」——旧文案会在每次登记时都说「到点不会主动发」，是错的。
+        const delivery =
+          r.channel === 'desktop'
+            ? '\n桌面不支持自动发送，这条只作记录。'
+            : '\n到点会按允许回复时段尝试发送；撞上安静时段会延后，不会丢掉。'
+        return [{ type: 'text', text: `${head}\n- ${r.reminderId}  ${when}  ${r.text}${delivery}${deferredNote(r)}` }]
+      },
+    },
+    execute: async (args: unknown, exec?: unknown) => {
+      try {
+        const scope = options.reminderScope?.(exec) ?? null
+        const input = asArgs<{ text?: string; in_minutes?: number; due_at?: string; timezone?: string }>(args)
+        const dueAt =
+          typeof input.due_at === 'string' && input.due_at.length > 0
+            ? input.due_at
+            : typeof input.in_minutes === 'number' && Number.isFinite(input.in_minutes)
+              ? new Date(Date.now() + Math.round(input.in_minutes) * 60_000).toISOString()
+              : ''
+        // 幂等键由「内容 + 时刻」派生：模型重试同一句话不会写成两条。
+        const requestId = `${input.text ?? ''}|${dueAt}`
+        const result = await core.createReminder({
+          dueAt,
+          timezone: input.timezone ?? 'Asia/Shanghai',
+          text: input.text ?? '',
+          requestId,
+          now: new Date().toISOString(),
+          receiver: scope,
+        })
+        return jsonSafe(result) as unknown as CreateReminderResult
+      } catch (error) {
+        return { ...toErrorPayload(error) } as unknown as CreateReminderResult
+      }
+    },
+  })
+
+  tools.listReminders = defineTool<ListRemindersResult>({
+    name: 'psyche_list_reminders',
+    description: '看这个会话/联系人登记过哪些提醒（最近 20 条）。用户问「我让你提醒我的事呢」时用。',
+    parameters: {
+      limit: { type: 'number', description: '默认 20，最多 50' },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => {
+        const fail = failed(value)
+        if (fail) return fail
+        if (!value.items.length) return [{ type: 'text', text: '还没有登记过提醒。' }]
+        const lines = value.items.map((r) => {
+          const state = reminderStateText(r)
+          return `- ${r.reminderId}  ${formatDateTime(r.dueAt)}  ${state}  ${r.text}${deferredNote(r)}`
+        })
+        const verdictable = value.items.filter(isAwaitingVerdict).length
+        const tail = verdictable
+          ? '\n\n其中有结果不确定的提醒：`received` 表示「消息确实发出去了」、`not-received` 表示「确实没发出去」，' +
+            '用 `psyche_resolve_delivery` 裁决；两种裁决都不会重发。'
+          : ''
+        return [{ type: 'text', text: `${value.total} 条：\n${lines.join('\n')}${tail}` }]
+      },
+    },
+    execute: async (args: unknown, exec?: unknown) => {
+      try {
+        const scope = options.reminderScope?.(exec) ?? null
+        const input = asArgs<{ limit?: number }>(args)
+        return jsonSafe(await core.listReminders(input.limit, scope)) as unknown as ListRemindersResult
+      } catch (error) {
+        return { ...toErrorPayload(error) } as unknown as ListRemindersResult
+      }
+    },
+  })
+
+  tools.resolveDelivery = defineTool<ResolveDeliveryResult>({
+    name: 'psyche_resolve_delivery',
+    description:
+      '裁决一条「结果不确定」的提醒：消息到底发出去没有，只有这一次人工确认能定。' +
+      'received = 确认已经发出；not-received = 确认没有发出。两种裁决都不会重发，也不改变原定时间。' +
+      '只有主人能裁决；普通联系人的提醒不能由心灵自己裁决，也不该替用户猜。',
+    parameters: {
+      reminder_id: { type: 'string', description: 'psyche_list_reminders 里显示「结果不确定（待裁决）」的 reminderId' },
+      verdict: {
+        type: 'string',
+        enum: ['received', 'not-received'],
+        description: 'received 表示确认发出去了；not-received 表示确认没发出去',
+      },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => {
+        const fail = failed(value)
+        if (fail) return fail
+        if (value.status === 'resolved') {
+          return [
+            {
+              type: 'text',
+              text: '已记录裁决：这条不会再自动发送，也不会重发。（记录里保留裁决人与时间。）',
+            },
+          ]
+        }
+        if (value.status === 'not-found') return [{ type: 'text', text: '找不到这条提醒或它对应的投递记录。' }]
+        if (value.status === 'conflict') {
+          return [{ type: 'text', text: `这条不是「结果不确定」状态（${value.reason ?? '状态冲突'}），没有改动。` }]
+        }
+        if (value.status === 'unavailable') return [{ type: 'text', text: '当前没有可用的回复队列，暂时不能裁决。' }]
+        return [{ type: 'text', text: '这条提醒不属于当前会话，不能裁决。' }]
+      },
+    },
+    execute: async (args: unknown, exec?: unknown) => {
+      try {
+        const scope = options.reminderScope?.(exec) ?? null
+        const input = asArgs<{ reminder_id?: string; verdict?: string }>(args)
+        const verdict = input.verdict === 'received' ? 'received' : 'not-received'
+        return jsonSafe(
+          await core.resolveReminderDelivery({
+            reminderId: input.reminder_id ?? '',
+            verdict,
+            now: new Date().toISOString(),
+            receiver: scope,
+          }),
+        ) as unknown as ResolveDeliveryResult
+      } catch (error) {
+        return { ...toErrorPayload(error) } as unknown as ResolveDeliveryResult
+      }
+    },
+  })
+
+  tools.cancelReminder = defineTool<CancelReminderResult>({
+    name: 'psyche_cancel_reminder',
+    description:
+      '取消一条还没到点的提醒。重复取消返回同一条、不报错。' +
+      '已经发出去或失败的提醒不能取消，返回里会保留原状态——不要对用户说「已撤销」。' +
+      '如果返回 in-flight 或 unknown，说明取消无法确认（已在发送路上／上次结果不确定），同样不能说「已取消」。',
+    parameters: {
+      reminder_id: { type: 'string', description: 'psyche_list_reminders 返回的 reminderId' },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => {
+        const fail = failed(value)
+        if (fail) return fail
+        if (value.status === 'cancelled') return [{ type: 'text', text: '已取消。' }]
+        if (value.status === 'replayed') {
+          const state = value.reminder?.status ?? 'unknown'
+          return [{ type: 'text', text: `这条不是「待发」状态（当前 ${state}），没有改动。` }]
+        }
+        if (value.status === 'in-flight') {
+          return [{ type: 'text', text: '这条已经在发送路上，取消不能确认；不能说「已撤销」。' }]
+        }
+        if (value.status === 'unknown') {
+          return [{ type: 'text', text: '这条上次投递结果不确定，普通取消改不动，只能等人工裁决。' }]
+        }
+        if (value.status === 'not-found') return [{ type: 'text', text: '找不到这条提醒。' }]
+        return [{ type: 'text', text: '这条提醒不属于当前会话，不能取消。' }]
+      },
+    },
+    execute: async (args: unknown, exec?: unknown) => {
+      try {
+        const scope = options.reminderScope?.(exec) ?? null
+        const input = asArgs<{ reminder_id?: string }>(args)
+        return jsonSafe(
+          await core.cancelReminder(input.reminder_id ?? '', new Date().toISOString(), scope),
+        ) as unknown as CancelReminderResult
+      } catch (error) {
+        return { ...toErrorPayload(error) } as unknown as CancelReminderResult
+      }
+    },
+  })
+
+  tools.growthCandidates = defineTool<GrowthCandidatesResult>({
+    name: 'psyche_growth_candidates',
+    description:
+      '看看心灵这段时间从经历里总结出的成长候选——还没被确认的。' +
+      '每条带 candidateId 和 hash；确认或拒绝时要原样带回来，内容变了会被拒。' +
+      '只在用户主动问「你最近对我有什么新的理解」或需要澄清时用，不要自己念给用户听。',
+    parameters: {
+      limit: { type: 'number', description: '最多几条，默认 5，最多 10' },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => {
+        const fail = failed(value)
+        if (fail) return fail
+        if (!value.items.length) return [{ type: 'text', text: '目前没有待确认的成长候选。' }]
+        const lines = value.items.map((item) => `- ${item.candidateId}（${item.type}，${item.independentCount} 条证据）${item.statement}`)
+        return [{ type: 'text', text: `${value.total} 条：\n${lines.join('\n')}` }]
+      },
+    },
+    execute: async (args: unknown) => {
+      try {
+        const input = asArgs<{ limit?: number }>(args)
+        return jsonSafe(
+          await core.growthCandidates(Number(input.limit) || 5),
+        ) as unknown as GrowthCandidatesResult
+      } catch (error) {
+        return { ...toErrorPayload(error) } as unknown as GrowthCandidatesResult
+      }
+    },
+  })
+
+  tools.growthDecide = defineTool<GrowthDecideResult>({
+    name: 'psyche_growth_decide',
+    description:
+      '对一条成长候选做出决定：confirm（确认它成立，之后会影响心灵对自己的描述）/ reject（不成立）/ withdraw（撤回之前确认过的）。' +
+      '必须带上 hash——那是用户看到的版本，内容变了就要重新看一遍再决定。' +
+      '确认是不可逆的，除非用户明确说要收下，否则不要自己确认。',
+    parameters: {
+      candidate_id: { type: 'string', description: 'psyche_growth_candidates 返回的 candidateId' },
+      decision: { type: 'string', description: 'confirm / reject / withdraw' },
+      hash: { type: 'string', description: 'psyche_growth_candidates 返回的 hash' },
+    },
+    output: {
+      schema: { type: 'json' },
+      render: (_args, value) => {
+        const fail = failed(value)
+        if (fail) return fail
+        if (value.idempotent) return [{ type: 'text', text: '这条决定之前已经记下了，没有重复写入。' }]
+        if (value.decision === 'confirm') return [{ type: 'text', text: '已确认。之后心灵对自己会多这一条。' }]
+        if (value.decision === 'reject') return [{ type: 'text', text: '已拒绝，不会再提这条。' }]
+        return [{ type: 'text', text: '已撤回，这条不再影响心灵对自己的描述。' }]
+      },
+    },
+    execute: async (args: unknown) => {
+      try {
+        const input = asArgs<{ candidate_id?: string; decision?: string; hash?: string }>(args)
+        return jsonSafe(
+          await core.growthDecide(
+            input.candidate_id ?? '',
+            input.decision ?? '',
+            input.hash ?? '',
+          ),
+        ) as unknown as GrowthDecideResult
+      } catch (error) {
+        return { ...toErrorPayload(error) } as unknown as GrowthDecideResult
+      }
+    },
+  })
+
   // 返回顺序 = 模型侧工具表顺序：五写在前、读在后。
   // 增删工具时要同时改这里和 index.ts 的桥接对象，否则工具表与实现会静默错位。
   return [
@@ -724,6 +1156,12 @@ export function buildTools(
     tools.relationship,
     tools.recall,
     tools.fetch,
+    tools.createReminder,
+    tools.listReminders,
+    tools.resolveDelivery,
+    tools.cancelReminder,
+    tools.growthCandidates,
+    tools.growthDecide,
   ]
 }
 

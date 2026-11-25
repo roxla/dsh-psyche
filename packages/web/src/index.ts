@@ -7,7 +7,7 @@
  */
 import type { PsycheCore } from 'dsh-psyche-contract'
 
-export const name = 'dsh-psyche-web'
+export const name = 'roxla-dsh-psyche-web'
 
 export interface WebOptions {
   enabled?: boolean

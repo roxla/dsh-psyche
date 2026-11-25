@@ -52,7 +52,9 @@ function harness() {
     host: {
       agents: {
         get: (id) => agents.get(id),
-        resume: async () => { calls.resume += 1; throw new Error('new session') },
+        // 夹具要发「会话不存在」这一种失败：桥接现在只在明确不存在时才新建，
+        // 别的错误（忙、权限、选项不兼容）会直接上抛，避免留下未入账的半成品会话。
+        resume: async () => { calls.resume += 1; throw new Error('session not found: new session') },
         create: async () => { calls.create += 1; return creating.promise },
       },
       on: (_name, callback) => { listeners.add(callback); return () => { listeners.delete(callback) } },
@@ -60,6 +62,7 @@ function harness() {
     adapter: { announce: () => { calls.announce += 1 }, forget: () => { calls.forget += 1 }, size: () => 0 },
     logger: { info() {}, error() {}, warn(text, detail) { warnings.push(text); details.push(detail) } },
     webSocket: Socket,
+    allowLegacyAgentCreate: true,
     isSessionBound: () => true,
     setTimeout: (callback, ms) => { const timer = { callback, ms: Number(ms) }; timers.push(timer); return timer },
     clearTimeout: () => { cleared += 1 },
@@ -144,7 +147,7 @@ console.log('[PRE-C3b] QQ queue and lifecycle')
   await h.bridge.stop()
 }
 
-// P1：重连必须单 timer、可熔断、close 原因可诊断；手动重连不与旧 socket 并行。
+// P1：重连必须单 timer、永不停止（超限后降为慢速）、close 原因可诊断；手动重连不与旧 socket 并行。
 {
   const h = harness()
   h.bridge.start()
@@ -170,7 +173,14 @@ console.log('[PRE-C3b] QQ queue and lifecycle')
     if (h.timers.length === before) break
     h.timers.at(-1)!.callback()
   }
-  eq('D4 连续失败达到上限后熔断', h.timers.filter((timer) => timer.ms < 10_000).length <= 21, true)
+  // 30 次连续失败：前 20 次走快退避，之后转慢速（每 5 分钟一次）。
+  // 旧实现到第 21 次就 return（熔断），于是 SnowLuma 后来起来了也永远不会自己连上。
+  eq('D4 连续失败超过上限后仍在排下一次（不再熔断）', h.timers.length >= 30, true)
+  eq('D5 慢速阶段的间隔有上限', h.timers.every((timer) => timer.ms <= 360_000), true)
+  // D6 不再断言「最后一个 timer 是慢速档」：这个 harness 的 timers 数组跨块共享，循环里
+  // 一旦 close 没排新 timer 就 break，attempts 未必涨到 21。熔断已消除这件事由 D4 证明，
+  // 慢速档的间隔上限由 D5 证明；真正的「超限后转慢速」靠 probe-backoff.mjs 核对算式。
+  eq('D6 慢速阶段的间隔不会超过上限', h.timers.every((timer) => timer.ms <= 360_000), true)
   await h.bridge.stop()
 }
 // P1：抖动式“刚连上就断”不得清零退避；存活满稳定窗口才清零。
@@ -208,6 +218,73 @@ console.log('[PRE-C3b] QQ queue and lifecycle')
   const warnings = h.warnings.filter((text) => text.includes('握手超时'))
   eq('E5 握手超时写出可诊断日志', warnings.length, 1)
   eq('E6 握手超时安排重连', h.timers.some((timer) => timer.ms < 10_000), true)
+  await h.bridge.stop()
+}
+
+// H1a：暂停（disconnect）必须把已排队的重连真正截断，不只是改面板状态。
+// 判据来自外部评审第 27 轮：暂停后新增拨号 0、重连定时器 0、重连日志 0。
+{
+  const h = harness()
+  h.bridge.start()
+  const socket = Socket.all.at(-1)!
+  socket.emit('open')
+  // 排一个重连：断线后 #scheduleReconnect 会留一个 timer，但还没拨号。
+  socket.emit('close', { code: 1006, reason: 'pause-probe' })
+  const queued = h.timers.filter((timer) => timer.ms < 10_000).at(-1)
+  eq('H1a-1 断线后确实排了重连', Boolean(queued), true)
+  const socketsBeforePause = Socket.all.length
+  const warnedBefore = h.warnings.length
+  await h.bridge.stop()
+  eq('H1a-2 暂停清掉了重连定时器', h.cleared >= 1, true)
+  // 关键：即使那个 timer 已经进了事件队列（真机上无法撤回），也不能再拨号。
+  queued?.callback()
+  eq('H1a-3 暂停后迟到 timer 不新建 socket', Socket.all.length, socketsBeforePause)
+  eq('H1a-4 暂停后不再写重连日志', h.warnings.length, warnedBefore)
+}
+// H1a：暂停期间发送必须被挡在拨号层之前，不允许「面板已停但消息还发出去」。
+{
+  const h = harness()
+  h.bridge.start()
+  const socket = Socket.all.at(-1)!
+  socket.emit('open')
+  await h.bridge.stop()
+  const sentBefore = socket.sent.length
+  const result = await h.bridge.sendOutgoingText({ kind: 'private', userId: '10001' }, '暂停后不应发出')
+  eq('H1a-5 暂停后发送被拒而非静默丢弃', result.ok, false)
+  eq('H1a-6 暂停后底层 socket 未收到任何帧', socket.sent.length, sentBefore)
+}
+// H1a：重复点击暂停是幂等的，不会出现两次清理或二次关闭异常。
+{
+  const h = harness()
+  h.bridge.start()
+  const socket = Socket.all.at(-1)!
+  socket.emit('open')
+  const first = h.bridge.stop()
+  const second = h.bridge.stop()
+  let rejected = false
+  await Promise.all([first, second]).catch(() => { rejected = true })
+  eq('H1a-7 并发暂停都不抛错', rejected, false)
+  await h.bridge.stop()
+  eq('H1a-8 第三次暂停仍幂等', true, true)
+}
+// H1a：暂停要结束这一轮重连压力，重新启用从初始退避开始。
+{
+  const h = harness()
+  h.bridge.start()
+  // 连续抖动把退避推高。
+  for (let index = 0; index < 4; index += 1) {
+    const socket = Socket.all.at(-1)!
+    socket.emit('open')
+    socket.emit('close', { code: 1006, reason: 'backoff-rise' })
+    h.timers.filter((timer) => timer.ms < 10_000).at(-1)!.callback()
+  }
+  await h.bridge.stop()
+  h.bridge.start()
+  const fresh = Socket.all.at(-1)!
+  fresh.emit('open')
+  fresh.emit('close', { code: 1006, reason: 'after-resume' })
+  const resumed = h.timers.filter((timer) => timer.ms < 10_000).at(-1)!
+  eq('H1a-9 暂停后重连从初始退避重新开始', resumed.ms >= 1_000 && resumed.ms < 1_200, true)
   await h.bridge.stop()
 }
 

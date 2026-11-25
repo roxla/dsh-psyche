@@ -116,6 +116,11 @@ function addFact(db: any, input: { sourceIds: string[]; statement: string; kind?
   }
 }
 
+// 老用例验证的是「有 Source 就该提炼」，批次门槛是另一层策略；这里显式降到 1 条，
+// 门槛本身由第 16–18 组用例验证。
+const reflect = (db: any, options: Parameters<typeof reflectGrowthCandidates>[1] = {}) =>
+  reflectGrowthCandidates(db, { minBatch: 1, ...options })
+
 const count = (db: any, table: string) => Number((db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n)
 function cleanup(): void {
   for (const dir of dirs) {
@@ -130,7 +135,7 @@ function cleanup(): void {
 // 1. 没有新 Source：不生成反思。
 {
   const db = await freshDb()
-  eq('no source -> no_source', reflectGrowthCandidates(db, { candidateFilter: false, now: T1 }).status, 'no_source')
+  eq('no source -> no_source', reflect(db, { candidateFilter: false, now: T1 }).status, 'no_source')
 }
 
 // 2. 外部网页 Source + fact revision：生成一个 new_fact 候选。
@@ -138,7 +143,7 @@ function cleanup(): void {
   const db = await freshDb()
   const web = addSource(db, { channel: 'web', origin: 'external' })
   addFact(db, { sourceIds: [web], statement: '用户偏好清晨写作' })
-  const first = reflectGrowthCandidates(db, { candidateFilter: false, now: T1, perContactDaily: 10, globalDaily: 10 })
+  const first = reflect(db, { candidateFilter: false, now: T1, perContactDaily: 10, globalDaily: 10 })
   eq('new fact -> proposed', first.status, 'proposed')
   eq('one candidate', first.candidates, 1)
   const candidate = db.prepare('SELECT * FROM growth_candidates LIMIT 1').get() as any
@@ -147,7 +152,7 @@ function cleanup(): void {
   eq('candidate independence', candidate.independent_count, 1)
   eq('candidate scope personal', candidate.scope, 'personal')
 
-  const again = reflectGrowthCandidates(db, { candidateFilter: false, now: T1, perContactDaily: 10, globalDaily: 10 })
+  const again = reflect(db, { candidateFilter: false, now: T1, perContactDaily: 10, globalDaily: 10 })
   eq('no new source after success -> no_source', again.status, 'no_source')
   eq('candidate count stable', count(db, 'growth_candidates'), 1)
 }
@@ -156,7 +161,7 @@ function cleanup(): void {
 {
   const db = await freshDb()
   addSource(db, { channel: 'desktop', origin: 'self' })
-  eq('assistant source ignored', reflectGrowthCandidates(db, { candidateFilter: false, now: T1 }).status, 'no_source')
+  eq('assistant source ignored', reflect(db, { candidateFilter: false, now: T1 }).status, 'no_source')
   eq('no reflection row for self', count(db, 'growth_reflections'), 0)
 }
 
@@ -166,23 +171,32 @@ function cleanup(): void {
   const a1 = addSource(db, { channel: 'group', roomId: 'rm_a', independence: 'grp_win_1' })
   const a2 = addSource(db, { channel: 'group', roomId: 'rm_a', independence: 'grp_win_1' })
   addFact(db, { sourceIds: [a1, a2], statement: '群里提到周五上线' })
-  const result = reflectGrowthCandidates(db, { candidateFilter: false, now: T1, perContactDaily: 10, globalDaily: 10 })
+  const result = reflect(db, { candidateFilter: false, now: T1, perContactDaily: 10, globalDaily: 10 })
   eq('group candidate proposed', result.status, 'proposed')
   const candidate = db.prepare('SELECT scope, independent_count FROM growth_candidates LIMIT 1').get() as any
   eq('same independence key -> count 1', candidate.independent_count, 1)
   eq('group scope room', candidate.scope, 'room:rm_a')
 }
 
-// 5. 跨群两条证据：scope 冲突，失败关闭。
+// 5. 跨群：两个群的消息不再凑成一批——否则会把 A 群的话提炼成关于 B 群的结论。
+//    （v29.07 起按来源分组，`scope_conflict` 这条失败关闭路径在新策略下不再被走到，
+//      但代码保留：分组键缺字段或未来引入跨组批处理时它仍是最后一道闸。）
 {
   const db = await freshDb()
   const a = addSource(db, { channel: 'group', roomId: 'rm_a', independence: 'win_a' })
   const b = addSource(db, { channel: 'group', roomId: 'rm_b', independence: 'win_b' })
   addFact(db, { sourceIds: [a, b], statement: '两个群都在聊同一件事' })
-  const result = reflectGrowthCandidates(db, { candidateFilter: false, now: T1, perContactDaily: 10, globalDaily: 10 })
-  eq('cross-room -> no_change', result.status, 'no_change')
-  eq('scope conflict reason', result.reason, 'scope_conflict')
-  eq('no candidate on conflict', count(db, 'growth_candidates'), 0)
+  const result = reflect(db, { candidateFilter: false, now: T1, perContactDaily: 10, globalDaily: 10 })
+  ok('cross-room 不再凑批', result.status === 'proposed' || result.status === 'no_change', result)
+  const rooms = db
+    .prepare(
+      `SELECT DISTINCT s.room_id AS room_id
+         FROM growth_reflection_processed_sources p
+         JOIN sources s ON s.source_id = p.source_id
+        WHERE s.channel = 'group'`,
+    )
+    .all() as Array<{ room_id: string }>
+  ok('一次只处理一个群', rooms.length <= 1, rooms)
 }
 
 // 6. 每日额度：默认每对象 1 次，第二次不同触发被跳过且不消耗额度。
@@ -190,12 +204,12 @@ function cleanup(): void {
   const db = await freshDb()
   const q1 = addSource(db, { channel: 'web', origin: 'external', independence: 'w1' })
   addFact(db, { sourceIds: [q1], statement: 'q1' })
-  eq('quota first proposed', reflectGrowthCandidates(db, { candidateFilter: false, now: T1 }).status, 'proposed')
+  eq('quota first proposed', reflect(db, { candidateFilter: false, now: T1 }).status, 'proposed')
 
   const q2At = new Date(Date.parse(T0) + 120_000).toISOString()
   const q2 = addSource(db, { channel: 'web', origin: 'external', independence: 'w2', at: q2At })
   addFact(db, { sourceIds: [q2], statement: 'q2', at: q2At })
-  const second = reflectGrowthCandidates(db, { candidateFilter: false, now: new Date(Date.parse(q2At) + 60_000) })
+  const second = reflect(db, { candidateFilter: false, now: new Date(Date.parse(q2At) + 60_000) })
   eq('quota second -> skipped_budget', second.status, 'skipped_budget')
   const row = db.prepare("SELECT status, next_eligible_at FROM growth_reflections WHERE status='skipped_budget'").get() as any
   ok('skipped row has next eligible', typeof row?.next_eligible_at === 'string')
@@ -221,14 +235,14 @@ function cleanup(): void {
   addFact(db, { sourceIds: [newer], statement: '较新的来源', at: '2026-11-15T02:02:00.000Z' })
   eq(
     'newer source proposed',
-    reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z'), perContactDaily: 10, globalDaily: 10 }).status,
+    reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z'), perContactDaily: 10, globalDaily: 10 }).status,
     'proposed',
   )
   const older = addSource(db, { channel: 'web', origin: 'external', at: '2026-11-15T02:00:30.000Z' })
   addFact(db, { sourceIds: [older], statement: '更早但未处理的来源', at: '2026-11-15T02:00:30.000Z' })
   eq(
     'older unprocessed still proposed',
-    reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-15T02:04:00.000Z'), perContactDaily: 10, globalDaily: 10 }).status,
+    reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:04:00.000Z'), perContactDaily: 10, globalDaily: 10 }).status,
     'proposed',
   )
 }
@@ -238,10 +252,10 @@ function cleanup(): void {
   const db = await freshDb()
   const first = addSource(db, { channel: 'private', sender: 'ct_a' })
   addFact(db, { sourceIds: [first], statement: '私聊一' })
-  eq('contact quota first', reflectGrowthCandidates(db, { candidateFilter: false, now: T1 }).status, 'proposed')
+  eq('contact quota first', reflect(db, { candidateFilter: false, now: T1 }).status, 'proposed')
   const second = addSource(db, { channel: 'private', sender: 'ct_a', at: '2026-11-15T02:02:00.000Z' })
   addFact(db, { sourceIds: [second], statement: '私聊二', at: '2026-11-15T02:02:00.000Z' })
-  const skipped = reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z') })
+  const skipped = reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z') })
   eq('contact quota second skipped', skipped.status, 'skipped_budget')
   const row = db.prepare("SELECT source_ids FROM growth_reflections WHERE status='skipped_budget'").get() as any
   eq('skipped snapshot binds pending source', JSON.parse(row.source_ids), [second])
@@ -255,10 +269,10 @@ function cleanup(): void {
   ).run(T0, T0)
   const a = addSource(db, { channel: 'private', sender: 'ct_a' })
   addFact(db, { sourceIds: [a], statement: 'A 的事' })
-  eq('contact A proposed', reflectGrowthCandidates(db, { candidateFilter: false, now: T1 }).status, 'proposed')
+  eq('contact A proposed', reflect(db, { candidateFilter: false, now: T1 }).status, 'proposed')
   const b = addSource(db, { channel: 'private', sender: 'ct_b', at: '2026-11-15T02:02:00.000Z' })
   addFact(db, { sourceIds: [b], statement: 'B 的事', at: '2026-11-15T02:02:00.000Z' })
-  eq('contact B still proposed', reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z') }).status, 'proposed')
+  eq('contact B still proposed', reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z') }).status, 'proposed')
 }
 
 // 11. 全局额度 1：第二个 Contact 也跳过。
@@ -269,12 +283,12 @@ function cleanup(): void {
   ).run(T0, T0)
   const a = addSource(db, { channel: 'private', sender: 'ct_a' })
   addFact(db, { sourceIds: [a], statement: 'A' })
-  eq('global first', reflectGrowthCandidates(db, { candidateFilter: false, now: T1, globalDaily: 1 }).status, 'proposed')
+  eq('global first', reflect(db, { candidateFilter: false, now: T1, globalDaily: 1 }).status, 'proposed')
   const b = addSource(db, { channel: 'private', sender: 'ct_b', at: '2026-11-15T02:02:00.000Z' })
   addFact(db, { sourceIds: [b], statement: 'B', at: '2026-11-15T02:02:00.000Z' })
   eq(
     'global second skipped',
-    reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z'), globalDaily: 1 }).status,
+    reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z'), globalDaily: 1 }).status,
     'skipped_budget',
   )
 }
@@ -284,15 +298,15 @@ function cleanup(): void {
   const db = await freshDb()
   const s1 = addSource(db, { channel: 'web', origin: 'external' })
   addFact(db, { sourceIds: [s1], statement: '第一批' })
-  eq('initial proposed', reflectGrowthCandidates(db, { candidateFilter: false, now: T1, perContactDaily: 1, globalDaily: 1 }).status, 'proposed')
+  eq('initial proposed', reflect(db, { candidateFilter: false, now: T1, perContactDaily: 1, globalDaily: 1 }).status, 'proposed')
   const s2 = addSource(db, { channel: 'web', origin: 'external', at: '2026-11-15T02:02:00.000Z' })
   addFact(db, { sourceIds: [s2], statement: '失败后重试', at: '2026-11-15T02:02:00.000Z' })
-  const skipped = reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z'), perContactDaily: 1, globalDaily: 1 })
+  const skipped = reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z'), perContactDaily: 1, globalDaily: 1 })
   eq('second skipped before failure', skipped.status, 'skipped_budget')
   db.prepare("UPDATE growth_reflections SET status='failed', next_eligible_at=NULL WHERE reflection_id=?").run(
     skipped.reflectionId,
   )
-  const retry = reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-15T02:04:00.000Z'), perContactDaily: 10, globalDaily: 10 })
+  const retry = reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:04:00.000Z'), perContactDaily: 10, globalDaily: 10 })
   eq('failed reused', retry.reflectionId, skipped.reflectionId)
   eq('failed retry proposed', retry.status, 'proposed')
 }
@@ -306,7 +320,7 @@ function cleanup(): void {
     `INSERT INTO growth_reflection_processed_sources (persona_id, source_id, reflection_id, contact_key, processed_at)
      VALUES ('main', ?, NULL, 'personal', ?)`,
   ).run(s, T0)
-  eq('legacy not replayed', reflectGrowthCandidates(db, { candidateFilter: false, now: T1 }).status, 'no_source')
+  eq('legacy not replayed', reflect(db, { candidateFilter: false, now: T1 }).status, 'no_source')
   eq('legacy count', countLegacyProcessedSources(db, 'main'), 1)
 }
 
@@ -315,21 +329,82 @@ function cleanup(): void {
   const db = await freshDb()
   const s1 = addSource(db, { channel: 'web', origin: 'external' })
   addFact(db, { sourceIds: [s1], statement: '第一批' })
-  eq('batch 1 proposed', reflectGrowthCandidates(db, { candidateFilter: false, now: T1 }).status, 'proposed')
+  eq('batch 1 proposed', reflect(db, { candidateFilter: false, now: T1 }).status, 'proposed')
   const s2 = addSource(db, { channel: 'web', origin: 'external', at: '2026-11-15T02:02:00.000Z' })
   addFact(db, { sourceIds: [s2], statement: '第二批' })
   eq(
     'batch 2 skipped',
-    reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z') }).status,
+    reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z') }).status,
     'skipped_budget',
   )
   const s3 = addSource(db, { channel: 'web', origin: 'external', at: '2026-11-15T02:04:00.000Z' })
   addFact(db, { sourceIds: [s3], statement: '第三批' })
-  reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-16T02:03:00.000Z'), perContactDaily: 10, globalDaily: 10 })
+  reflect(db, { candidateFilter: false, now: new Date('2026-11-16T02:03:00.000Z'), perContactDaily: 10, globalDaily: 10 })
   const processed = new Set(
     (db.prepare('SELECT source_id FROM growth_reflection_processed_sources').all() as any[]).map((row) => row.source_id),
   )
   ok('retry processed original batch only', processed.has(s2) && !processed.has(s3))
+}
+
+// 16. 批次门槛：同一会话攒够 minBatch 才跑；不同会话/不同联系人绝不混批。
+{
+  const db = await freshDb()
+  db.prepare(
+    "INSERT OR IGNORE INTO contacts (contact_id, persona_id, platform, stable_user_id, display_name, created_at, updated_at) VALUES ('ct_b','main','qq','u_b','B',?,?)",
+  ).run(T0, T0)
+  // 甲、乙、群各一条，都不足 24 小时 —— 三条放一起够 3 条，但分属三个会话。
+  addSource(db, { channel: 'private', sender: 'ct_a' })
+  addSource(db, { channel: 'private', sender: 'ct_b' })
+  addSource(db, { channel: 'group', roomId: 'rm_a' })
+  const thin = reflect(db, { candidateFilter: false, now: T1, minBatch: 3 })
+  eq('thin groups stay below batch', thin.status, 'below_batch')
+  ok('below batch 给了下次可跑时间', typeof thin.nextEligibleAt === 'string', thin)
+  eq('below batch wrote no reflection', count(db, 'growth_reflections'), 0)
+  eq('below batch wrote no processed', count(db, 'growth_reflection_processed_sources'), 0)
+
+  // 给甲再加两条：只有甲这一组够了，乙与群仍然不该被消费。
+  addSource(db, { channel: 'private', sender: 'ct_a' })
+  addSource(db, { channel: 'private', sender: 'ct_a' })
+  const ran = reflect(db, { candidateFilter: false, now: T1, minBatch: 3 })
+  ok('ready group runs', ran.status === 'proposed' || ran.status === 'no_change', ran)
+  const consumed = db
+    .prepare('SELECT source_id, contact_key FROM growth_reflection_processed_sources')
+    .all() as Array<{ source_id: string; contact_key: string }>
+  eq('only the ready group was consumed', consumed.length, 3)
+  ok(
+    'all consumed belong to contact A',
+    consumed.every((row) => row.contact_key === 'contact:ct_a'),
+    consumed,
+  )
+}
+
+// 17. 冷会话兜底：不足 minBatch 但最老一条已等够 maxWaitHours，必须放行。
+{
+  const db = await freshDb()
+  addSource(db, { channel: 'private', sender: 'ct_a', at: '2026-11-15T02:00:00.000Z' })
+  const waited = new Date('2026-11-16T03:00:00.000Z')
+  const ran = reflect(db, { candidateFilter: false, now: waited, minBatch: 3 })
+  ok('cold session unblocks after maxWaitHours', ran.status !== 'below_batch', ran)
+}
+
+// 18. 已有 skipped_budget 重试不套用新的批次门槛：到期就该按原集重跑。
+{
+  const db = await freshDb()
+  const s = addSource(db, { channel: 'web', origin: 'external' })
+  addFact(db, { sourceIds: [s], statement: '初版' })
+  eq('first run proposed', reflect(db, { candidateFilter: false, now: T1 }).status, 'proposed')
+  const s2 = addSource(db, { channel: 'web', origin: 'external', at: '2026-11-15T02:02:00.000Z' })
+  addFact(db, { sourceIds: [s2], statement: '第二批' })
+  const skipped = reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z') })
+  eq('second batch skipped by budget', skipped.status, 'skipped_budget')
+  // 次日重试：集合仍只有 s2，条数 1 < minBatch，但重试路径不该被门槛挡住。
+  const retried = reflect(db, {
+    candidateFilter: false,
+    now: new Date('2026-11-16T02:03:00.000Z'),
+    perContactDaily: 10,
+    globalDaily: 10,
+  })
+  ok('skipped retry ignores batch gate', retried.status !== 'below_batch', retried)
 }
 
 // 15. 部分 Source 已被其他反思处理：只处理剩余，且不覆盖原账本。
@@ -337,21 +412,21 @@ function cleanup(): void {
   const db = await freshDb()
   const s1 = addSource(db, { channel: 'web', origin: 'external' })
   addFact(db, { sourceIds: [s1], statement: '已处理' })
-  const seed = reflectGrowthCandidates(db, { candidateFilter: false, now: T1 })
+  const seed = reflect(db, { candidateFilter: false, now: T1 })
   eq('seed proposed', seed.status, 'proposed')
   const s2 = addSource(db, { channel: 'web', origin: 'external', at: '2026-11-15T02:02:00.000Z' })
   const s3 = addSource(db, { channel: 'web', origin: 'external', at: '2026-11-15T02:02:10.000Z' })
   addFact(db, { sourceIds: [s2, s3], statement: '部分已处理', at: '2026-11-15T02:02:10.000Z' })
   eq(
     'second skipped',
-    reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z') }).status,
+    reflect(db, { candidateFilter: false, now: new Date('2026-11-15T02:03:00.000Z') }).status,
     'skipped_budget',
   )
   db.prepare(
     `INSERT INTO growth_reflection_processed_sources (persona_id, source_id, reflection_id, contact_key, processed_at)
      VALUES ('main', ?, ?, 'personal', ?)`,
   ).run(s2, seed.reflectionId, '2026-11-15T02:03:30.000Z')
-  reflectGrowthCandidates(db, { candidateFilter: false, now: new Date('2026-11-16T02:03:00.000Z'), perContactDaily: 10, globalDaily: 10 })
+  reflect(db, { candidateFilter: false, now: new Date('2026-11-16T02:03:00.000Z'), perContactDaily: 10, globalDaily: 10 })
   const rows = db.prepare('SELECT source_id, reflection_id FROM growth_reflection_processed_sources').all() as any[]
   ok('already processed source kept', rows.find((row) => row.source_id === s2)?.reflection_id === seed.reflectionId)
   ok('remaining source processed', rows.some((row) => row.source_id === s3))

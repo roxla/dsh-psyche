@@ -30,6 +30,8 @@ export interface QqBridgeAdminSnapshot {
   allowFromValid: boolean
   allowFromOwner: string | null
   allowFromExtra: string[]
+  /** 当前生效的群白名单；空数组表示一个群都不采集。 */
+  allowFromGroups: string[]
   counts: {
     received: number
     delivered: number
@@ -44,11 +46,21 @@ export interface QqBridgeAdminSnapshot {
   lastHeartbeatAt: string | null
   lastMessageAt: string | null
   lastSentAt: string | null
+  reconnect: {
+    attempts: number
+    mode: 'idle' | 'fast' | 'slow'
+    lastAttemptAt: string | null
+    nextAttemptAt: string | null
+  }
 }
 
 export interface QqAdminPayload {
   ok: true
   enabled: boolean
+  /** 桥接启动失败的原因；`enabled: false` 且这里非空，说明是故障不是没开。 */
+  startError?: string | null
+  /** 启动失败累计次数。 */
+  failedEpoch?: number
   connection: QqAdminConnection
   account: { uinMasked: string | null; nickname: string | null; online: boolean | null }
   allowFrom: {
@@ -56,12 +68,26 @@ export interface QqAdminPayload {
     ownerMasked: string | null
     extraCount: number
     extraMasked: string[]
+    /** 群白名单条数；和私聊放在同一张对象列表里展示。 */
+    groupsCount: number
+    groupsMasked: string[]
   }
   counts: QqBridgeAdminSnapshot['counts']
   activity: {
     lastHeartbeatAt: string | null
     lastMessageAt: string | null
     lastSentAt: string | null
+  }
+  /**
+   * 重连状态。用户问「SnowLuma 到底在不在跑」时，看这里：
+   * `attempts > 0 && lastAttemptAt !== null` 就说明插件正在敲门，没连上，
+   * 也就是网关没监听——不是插件坏了、也不是白名单拒了。
+   */
+  reconnect: {
+    attempts: number
+    mode: 'idle' | 'fast' | 'slow'
+    lastAttemptAt: string | null
+    nextAttemptAt: string | null
   }
   logs: QqLogEntry[]
 }
@@ -138,6 +164,17 @@ export function formatQqLogLine(message: string, detail?: Record<string, unknown
 
 export function buildQqAdminPayload(input: {
   enabled: boolean
+  /**
+   * 桥接最近一次的启动错误。
+   *
+   * `enabled: false` 有两种原因——配置没开（正常）和构造函数抛错（故障）。
+   * 区分它们只需要这一个字段，但过去面板只有 `enabled`，
+   * 于是「启动失败」被显示成「QQ 通道没有启用」，用户按「没开」去查配置，
+   * 永远查不到真正的报错。
+   */
+  startError?: string | null
+  /** 启动失败累计次数，用来判断是不是反复失败。 */
+  failedEpoch?: number
   snapshot: QqBridgeAdminSnapshot | null
   logs: QqLogEntry[]
 }): QqAdminPayload {
@@ -146,9 +183,11 @@ export function buildQqAdminPayload(input: {
     return {
       ok: true,
       enabled: false,
+      startError: input.startError ?? null,
+      failedEpoch: input.failedEpoch ?? 0,
       connection: 'unknown',
       account: { uinMasked: null, nickname: null, online: null },
-      allowFrom: { ownerConfigured: false, ownerMasked: null, extraCount: 0, extraMasked: [] },
+      allowFrom: { ownerConfigured: false, ownerMasked: null, extraCount: 0, extraMasked: [], groupsCount: 0, groupsMasked: [] },
       counts: {
         received: 0,
         delivered: 0,
@@ -161,6 +200,7 @@ export function buildQqAdminPayload(input: {
         contactSuppressed: 0,
       },
       activity: { lastHeartbeatAt: null, lastMessageAt: null, lastSentAt: null },
+      reconnect: { attempts: 0, mode: 'idle', lastAttemptAt: null, nextAttemptAt: null },
       logs: input.logs.slice(),
     }
   }
@@ -178,6 +218,8 @@ export function buildQqAdminPayload(input: {
       ownerMasked: maskQqId(snapshot.allowFromOwner),
       extraCount: snapshot.allowFromExtra.length,
       extraMasked: snapshot.allowFromExtra.map((id) => maskQqId(id) ?? '***'),
+      groupsCount: snapshot.allowFromGroups.length,
+      groupsMasked: snapshot.allowFromGroups.map((id) => maskQqId(id) ?? '***'),
     },
     counts: { ...snapshot.counts },
     activity: {
@@ -185,6 +227,7 @@ export function buildQqAdminPayload(input: {
       lastMessageAt: snapshot.lastMessageAt,
       lastSentAt: snapshot.lastSentAt,
     },
+    reconnect: snapshot.reconnect,
     logs: input.logs.slice(),
   }
 }

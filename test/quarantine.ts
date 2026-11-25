@@ -53,7 +53,7 @@ console.log('\n[R6-CAP-2] Source 隔离')
 // ── 1. schema v12 ───────────────────────────────────────────────────────
 {
   const version = db2.get('PRAGMA user_version')
-  eq('Q-01 schema 版本是 31', Number(version?.user_version ?? version?.value ?? 0), 31)
+  eq('Q-01 schema 版本是 42', Number(version?.user_version ?? version?.value ?? 0), 42)
   const table = db2.get(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quarantined_sources'`)
   ok('Q-02 quarantined_sources 表存在', table !== undefined)
 }

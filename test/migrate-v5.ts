@@ -1,4 +1,4 @@
-// P2-FTS5 E3 第二批：真实 v5 → v6 快照迁移（V5-01~12）。
+﻿// P2-FTS5 E3 第二批：真实 v5 → v6 快照迁移（V5-01~12）。
 //
 // 关键点：不是把 v6 库的 user_version 改成 5，而是用 schema.ts 里真实的 v1–v5 迁移 SQL
 // 重建一个 v5 库，再按真实启动路径 openDatabase() 走到 v6。迁移前后做聚合比较，不保存正文。
@@ -184,7 +184,7 @@ const opened = await openDatabase({ file, driverPreference: 'auto', logger: log 
 const db = opened.db
 const after = snapshot(db)
 
-eq('V5-02 迁移后 user_version=31', after.userVersion, 31)
+eq('V5-02 迁移后 user_version=42', after.userVersion, 42)
 eq('V5-04 Artifact 数量不变', after.artifacts, before.artifacts)
 eq('V5-04 revision 数量不变', after.revisions, before.revisions)
 eq(
@@ -234,7 +234,7 @@ ok('V5-09 restricted 历史不被普通检索返回', !restrictedHits.some((hit)
 // V5-11：重复 migrate 不重复执行
 const migrationsBefore = db.get(`SELECT count(*) AS n FROM schema_migrations`).n
 const reopened = await openDatabase({ file, driverPreference: 'auto', logger: log })
-eq('V5-11 重复启动版本不变', Number(reopened.db.pragma('user_version') ?? 0), 31)
+eq('V5-11 重复启动版本不变', Number(reopened.db.pragma('user_version') ?? 0), 42)
 eq('V5-11 schema_migrations 不重复', reopened.db.get(`SELECT count(*) AS n FROM schema_migrations`).n, migrationsBefore)
 reopened.db.close()
 

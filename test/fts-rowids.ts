@@ -1,4 +1,4 @@
-// P2-E6-C1：FTS 行定位旁路表（fts_rowids）测试。
+﻿// P2-E6-C1：FTS 行定位旁路表（fts_rowids）测试。
 //
 // 背景：fts_index 的 kind/ref_id 是 UNINDEXED 列，按它们 DELETE 会全表扫描；
 // 单条 upsert O(N)、逐行 rebuild O(N²)（E6-C 实测 S3 rebuild 295 秒）。
@@ -127,7 +127,7 @@ const db1 = opened1.db
 migrate(db1, log)
 const core1 = new Core({ db: db1, config: {}, logger: log, dataDir: dir1 })
 
-ok('新库迁移到 v31', Number(db1.get('PRAGMA user_version').user_version ?? 0) === 31, db1.get('PRAGMA user_version'))
+ok('新库迁移到 v42', Number(db1.get('PRAGMA user_version').user_version ?? 0) === 42, db1.get('PRAGMA user_version'))
 ok('fts_rowids 表存在', Boolean(db1.get(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fts_rowids'`)))
 eq('新库映射表为空', countRows(db1, 'fts_rowids'), 0)
 eq('新库 verify 干净', cleanVerify(db1), {
@@ -146,7 +146,7 @@ const v9 = makeV9()
 const openedV9 = await openDatabase({ file: v9.file, driverPreference: 'auto', logger: log })
 const dbV9 = openedV9.db
 migrate(dbV9, log)
-ok('v9 库升级到 v31', Number(dbV9.get('PRAGMA user_version').user_version ?? 0) === 31)
+ok('v9 库升级到 v42', Number(dbV9.get('PRAGMA user_version').user_version ?? 0) === 42)
 eq('回填后映射行数等于 FTS 行数', countRows(dbV9, 'fts_rowids'), countRows(dbV9, 'fts_index'))
 const backfilled = rowsOf(dbV9)
 eq(

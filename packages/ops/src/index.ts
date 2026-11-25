@@ -7,7 +7,7 @@
  */
 import type { PsycheCore } from 'dsh-psyche-contract'
 
-export const name = 'dsh-psyche-ops'
+export const name = 'roxla-dsh-psyche-ops'
 
 export interface OpsOptions {
   enabled?: boolean

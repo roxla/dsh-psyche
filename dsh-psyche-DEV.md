@@ -1,7 +1,7 @@
 # dsh-psyche-DEV — 心灵 · Psyche 设计与迁移基线
 
 版本：v1.0（PSY-M0~M6）
-状态：PSY-M1~M3 已完成；M5 干净 clone 构建已通过；M4 隔离 Host 与发布包安装待实测。冻结方案见 GPT 评审记录（M01–M10）；迁移报告见 `docs/audit/psy-m1-m3.md`。
+状态：PSY-M1~M3 已完成；M5 干净 clone 构建已通过；M4 隔离 Host 与空数据根已实测通过（2026-11-25，`docs/audit/psy-m4.md`），M4 的发布包安装路径仍未验。冻结方案见 GPT 评审记录（M01–M10）；迁移报告见 `docs/audit/psy-m1-m3.md`。
 
 ## 1. 定位
 

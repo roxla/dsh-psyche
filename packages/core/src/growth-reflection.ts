@@ -11,6 +11,12 @@
  * - 配额按 contact_key 每天 1 个成功 reflection、全局 3 个，整轮在 BEGIN IMMEDIATE 内；
  * - skipped_budget 绑定原始 Source 集合（source_ids），到期只重试原集合，不并入新 Source；
  * - 崩溃恢复：evaluating 超过 timeout 先置 failed。
+ *
+ * v29.07 增加批次门槛：同一会话（platform + person+room 绑定 + session_ref）攒够
+ * `minBatch`（默认 3）条才进入复盘；不足时返回 `below_batch` 且不写任何表。
+ * 依据是实测：58 次复盘各自只读了 1 条消息，产出为 0——单条消息没有上下文，提炼不出结论，
+ * 那两条碎片候选就是这么来的。不同会话/不同联系人绝不混批，否则会把甲说的话提炼成关于乙的结论。
+ * 冷会话兜底：不足门槛但最老一条已等够 `maxWaitHours`（默认 24）时仍放行，避免永远等不到。
  */
 import { createHash } from 'node:crypto'
 import type { Db } from './adapter.js'
@@ -33,15 +39,26 @@ export interface ReflectGrowthOptions {
   timeoutMs?: number
   perContactDaily?: number
   globalDaily?: number
+  /**
+   * 一批复盘至少要有几条 Source。
+   *
+   * 实测里 58 次复盘各自只读了 1 条消息，产出为 0——单条消息没有上下文，提炼不出结论，
+   * 那两条碎片候选就是这么来的。低于门槛先不跑，等同一会话攒够。
+   */
+  minBatch?: number
+  /** 不足 `minBatch` 时最多等多久；超过就按现有条数跑一次，避免冷会话永远等不到。 */
+  maxWaitHours?: number
   /** 生产默认开启；测试夹具可用 false 跳过内容闸，只验证投影/去重。 */
   candidateFilter?: boolean
 }
 
 export interface ReflectGrowthResult {
-  status: 'no_source' | 'deduplicated' | 'skipped_budget' | 'no_change' | 'proposed' | 'failed'
+  status: 'no_source' | 'deduplicated' | 'skipped_budget' | 'no_change' | 'proposed' | 'failed' | 'below_batch'
   reflectionId: string | null
   candidates: number
   reason?: string
+  /** 仅 `below_batch` 时给出：这个会话最早何时够条件再跑。 */
+  nextEligibleAt?: string
 }
 
 interface SourceRow {
@@ -51,6 +68,8 @@ interface SourceRow {
   sender_contact_id: string | null
   independence_key: string | null
   activity_window_key: string | null
+  session_ref: string | null
+  created_at: string
 }
 
 interface PendingSource extends SourceRow {
@@ -193,7 +212,7 @@ export function reflectGrowthCandidates(db: Db, options: ReflectGrowthOptions = 
     const pending = db
       .all<SourceRow>(
         `SELECT s.source_id, s.channel, s.room_id, s.sender_contact_id,
-                s.independence_key, s.activity_window_key
+                s.independence_key, s.activity_window_key, s.session_ref, s.created_at
            FROM sources s
           WHERE s.persona_id=? AND s.origin IN ('user','external')
             AND NOT EXISTS (
@@ -252,6 +271,55 @@ export function reflectGrowthCandidates(db: Db, options: ReflectGrowthOptions = 
         return { status: 'no_change', reflectionId, candidates: 0, reason: 'sources_consumed' }
       }
     } else {
+      // 新任务先分组：不同会话、不同联系人的消息不能凑成同一批，否则会把甲说的话
+      // 提炼成关于乙的结论。分组键复用已有绑定字段，不引入新的批组引擎。
+      const groups = new Map<string, PendingSource[]>()
+      for (const source of bound) {
+        const key = `${source.channel}|${source.contact_key}|${source.session_ref ?? ''}`
+        const list = groups.get(key)
+        if (list === undefined) groups.set(key, [source])
+        else list.push(source)
+      }
+      const minBatch = options.minBatch ?? 3
+      const maxWaitMs = (options.maxWaitHours ?? 24) * 3_600_000
+      const nowMs = now.getTime()
+      let chosen: PendingSource[] | null = null
+      let chosenOldest = Number.POSITIVE_INFINITY
+      // 先找已攒够门槛的组；都达标时取等待最久的那组。
+      for (const list of groups.values()) {
+        if (list.length < minBatch) continue
+        const oldest = Date.parse(list[0]?.created_at ?? '')
+        if (Number.isFinite(oldest) && oldest < chosenOldest) {
+          chosen = list
+          chosenOldest = oldest
+        }
+      }
+      // 都不够：只有最老一条已经等够 maxWaitHours 才放行，避免冷会话被饿死。
+      if (chosen === null) {
+        for (const list of groups.values()) {
+          const oldest = Date.parse(list[0]?.created_at ?? '')
+          if (Number.isFinite(oldest) && nowMs - oldest >= maxWaitMs && oldest < chosenOldest) {
+            chosen = list
+            chosenOldest = oldest
+          }
+        }
+      }
+      if (chosen === null) {
+        const oldestAll = bound.reduce((min, source) => {
+          const at = Date.parse(source.created_at)
+          return Number.isFinite(at) && at < min ? at : min
+        }, Number.POSITIVE_INFINITY)
+        return {
+          status: 'below_batch',
+          reflectionId: null,
+          candidates: 0,
+          reason: 'below_batch',
+          ...(Number.isFinite(oldestAll)
+            ? { nextEligibleAt: new Date(oldestAll + maxWaitMs).toISOString() }
+            : {}),
+        }
+      }
+
       const globalUsed = Number(
         (
           db.get<{ n: number }>(
@@ -262,12 +330,12 @@ export function reflectGrowthCandidates(db: Db, options: ReflectGrowthOptions = 
         ).n,
       )
       if (globalUsed >= globalDaily) {
-        const ids = bound.map((source) => source.source_id)
+        const ids = chosen.map((source) => source.source_id)
         return insertSkipped(db, personaId, triggerKeyOf(personaId, ids), ids, now, dayStart, 'global_budget')
       }
 
       const keyUsed = new Map<string, number>()
-      for (const source of bound) {
+      for (const source of chosen) {
         if (keyUsed.has(source.contact_key)) continue
         const used = Number(
           (
@@ -280,9 +348,9 @@ export function reflectGrowthCandidates(db: Db, options: ReflectGrowthOptions = 
         )
         keyUsed.set(source.contact_key, used)
       }
-      effective = bound.filter((source) => (keyUsed.get(source.contact_key) ?? 0) < perContactDaily)
+      effective = chosen.filter((source) => (keyUsed.get(source.contact_key) ?? 0) < perContactDaily)
       if (effective.length === 0) {
-        const ids = bound.map((source) => source.source_id)
+        const ids = chosen.map((source) => source.source_id)
         return insertSkipped(db, personaId, triggerKeyOf(personaId, ids), ids, now, dayStart, 'daily_budget')
       }
 

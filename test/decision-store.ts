@@ -1,4 +1,4 @@
-// 决策回执（P2 Completion Batch 阶段 2，schema v16）。
+﻿// 决策回执（P2 Completion Batch 阶段 2，schema v16）。
 //
 // 验收口径：
 // - 一次决策一个壳：op_id 唯一，重试幂等；
@@ -53,11 +53,11 @@ migrate(db, log)
 
 console.log('\n[Decision Store] schema v16')
 
-eq('schema 版本是 31', Number((db.get('PRAGMA user_version') as { user_version?: number }).user_version ?? 0), 31)
+eq('schema 版本是 42', Number((db.get('PRAGMA user_version') as { user_version?: number }).user_version ?? 0), 42)
 const tables = db.all<{ name: string }>(
   `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'fts_index%' AND name NOT LIKE 'sqlite_%'`,
 )
-eq('表数 70（含 decision_runs / decision_items / diaries / diary_versions / mood_meta / proactive_outbox / growth_confirmations / memory_merge_events / memory_archive_events / external_sources / external_source_deletion_events / external_source_erase_events）', tables.length, 70)
+eq('表数 81（含 project handoff 七张、提醒与授权代次、裁决证据）', tables.length, 81)
 ok('decision_runs 存在', tables.some((t) => t.name === 'decision_runs'))
 ok('decision_items 存在', tables.some((t) => t.name === 'decision_items'))
 

@@ -183,7 +183,7 @@ const targetGroup = (groupId: string) => ({ kind: 'group' as const, groupId })
     host: {
       agents: {
         get: () => undefined,
-        resume: async () => { throw new Error('no session') },
+        resume: async () => { throw new Error('session not found: qq-private-10001') },
         create: async () => ({ agent: { followup() {} } }),
       },
       on: () => () => {},
@@ -191,6 +191,7 @@ const targetGroup = (groupId: string) => ({ kind: 'group' as const, groupId })
     adapter: { announce() {}, forget() {}, size() { return 0 } },
     logger: { info() {}, warn() {}, error() {} },
     webSocket: FakeSocket as any,
+    allowLegacyAgentCreate: true,
     isSessionBound: () => true,
   } as any)
   bridge.start()

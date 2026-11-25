@@ -83,7 +83,7 @@ eq('GRANT-05 普通内容不需要授权', plainOk.grantRequired, false)
 // ── 3. 签发 grant → 同一内容可落 public ──────────────────────────────
 const grant = await core.grantDisclosure({
   statement: sensitive,
-  grantedBy: 'owner:test',
+  grantedBy: 'owner:roxla',
   reason: '用户明确说这条可以公开检索',
   ttlMs: 60_000,
 })
@@ -131,7 +131,7 @@ eq('GRANT-13 伪造 grantId 被拒', forged.disclosure, 'restricted')
 
 const otherGrant = await core.grantDisclosure({
   statement: '另一段敏感内容：身份证 110101199001011234。',
-  grantedBy: 'owner:test',
+  grantedBy: 'owner:roxla',
   ttlMs: 60_000,
 })
 const src6 = await source('内容不匹配', 'session-grant-6')
@@ -147,7 +147,7 @@ eq('GRANT-14 内容不匹配的 grant 被拒', mismatch.disclosure, 'restricted'
 
 const expired = await core.grantDisclosure({
   statement: sensitive,
-  grantedBy: 'owner:test',
+  grantedBy: 'owner:roxla',
   ttlMs: 1,
 })
 await new Promise((resolve) => setTimeout(resolve, 10))
@@ -173,7 +173,7 @@ const target = await core.remember({
 })
 const targetGrant = await core.grantDisclosure({
   artifactId: target.artifactId,
-  grantedBy: 'owner:test',
+  grantedBy: 'owner:roxla',
   ttlMs: 60_000,
 })
 const revised = await core.revise({
@@ -194,7 +194,7 @@ const audit = db.get(
 ok('GRANT-18 授权审计行存在', audit !== undefined && audit !== null)
 ok('GRANT-19 用过的 grant 有 used_at', typeof audit?.used_at === 'string' && audit.used_at.length > 0)
 eq('GRANT-20 审计记录前后披露等级', [audit?.before_disclosure, audit?.after_disclosure], ['restricted', 'public'])
-eq('GRANT-21 审计记录授权人', audit?.granted_by, 'owner:test')
+eq('GRANT-21 审计记录授权人', audit?.granted_by, 'owner:roxla')
 
 // ── 8. 事务回滚：revision 写入失败时 grant 不被消费 ─────────────────────
 const src9 = await source('回滚授权', 'session-grant-9')
@@ -207,7 +207,7 @@ const rollbackTarget = await core.remember({
 })
 const rollbackGrant = await core.grantDisclosure({
   artifactId: rollbackTarget.artifactId,
-  grantedBy: 'owner:test',
+  grantedBy: 'owner:roxla',
   ttlMs: 60_000,
 })
 let conflict = false
@@ -252,7 +252,7 @@ const base = await core.remember({
   sourceIds: [src10],
   disclosure: 'restricted',
 })
-const g10 = await core.grantDisclosure({ artifactId: base.artifactId, grantedBy: 'owner:test', ttlMs: 60_000 })
+const g10 = await core.grantDisclosure({ artifactId: base.artifactId, grantedBy: 'owner:roxla', ttlMs: 60_000 })
 const rev2 = await core.revise({
   artifactId: base.artifactId,
   statement: sensitive,
@@ -278,7 +278,7 @@ const a11 = await core.remember({
   sourceIds: [src11],
   disclosure: 'restricted',
 })
-const g11 = await core.grantDisclosure({ artifactId: a11.artifactId, grantedBy: 'owner:test', ttlMs: 60_000 })
+const g11 = await core.grantDisclosure({ artifactId: a11.artifactId, grantedBy: 'owner:roxla', ttlMs: 60_000 })
 const r2 = await core.revise({
   artifactId: a11.artifactId,
   statement: sensitive,
@@ -306,7 +306,7 @@ const a12 = await core.remember({
   sourceIds: [src12],
   disclosure: 'restricted',
 })
-const g12 = await core.grantDisclosure({ artifactId: a12.artifactId, grantedBy: 'owner:test', ttlMs: 60_000 })
+const g12 = await core.grantDisclosure({ artifactId: a12.artifactId, grantedBy: 'owner:roxla', ttlMs: 60_000 })
 const revoked = await core.revokeDisclosureGrant({ grantId: g12.grantId, revokedBy: 'host:owner' })
 eq('GRANT-32 撤销成功', revoked.alreadyRevoked, false)
 const r4 = await core.revise({
@@ -327,15 +327,15 @@ ok('GRANT-34 已消费的 grant 不能撤销', revokeConsumedRejected)
 
 // ── 11. 签发幂等 ─────────────────────────────────────────────────────
 const grantOpId = 'grant-op-idem-1'
-const firstGrant = await core.grantDisclosure({ statement: sensitive, grantedBy: 'owner:test', opId: grantOpId })
-const againGrant = await core.grantDisclosure({ statement: sensitive, grantedBy: 'owner:test', opId: grantOpId })
+const firstGrant = await core.grantDisclosure({ statement: sensitive, grantedBy: 'owner:roxla', opId: grantOpId })
+const againGrant = await core.grantDisclosure({ statement: sensitive, grantedBy: 'owner:roxla', opId: grantOpId })
 eq('GRANT-35 同 opId 重放拿回同一张 grant', againGrant.grantId, firstGrant.grantId)
 ok('GRANT-36 重放标记 replayed', againGrant.replayed === true && firstGrant.replayed === false)
 const opRows = db.get(`SELECT COUNT(*) AS n FROM disclosure_grants WHERE op_id = ?`, [grantOpId]).n
 eq('GRANT-37 同 opId 只落一行', opRows, 1)
 let opConflict = false
 try {
-  await core.grantDisclosure({ statement: '另一段敏感内容 13600136000。', grantedBy: 'owner:test', opId: grantOpId })
+  await core.grantDisclosure({ statement: '另一段敏感内容 13600136000。', grantedBy: 'owner:roxla', opId: grantOpId })
 } catch (error) {
   opConflict = error && error.code === 'E_IDEMPOTENT_CONFLICT'
 }

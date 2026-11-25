@@ -66,7 +66,7 @@ function makeBridge(overrides: Record<string, unknown> = {}) {
       },
       async resume(): Promise<never> {
         calls.resume += 1
-        throw new Error('no session')
+        throw new Error('session not found: qq-private-10001')
       },
       async create(): Promise<{ agent: { followup(): void } }> {
         calls.create += 1
@@ -106,6 +106,7 @@ function makeBridge(overrides: Record<string, unknown> = {}) {
     adapter,
     logger,
     webSocket: FakeSocket as unknown as new (url: string) => unknown,
+    allowLegacyAgentCreate: true,
     isSessionBound: () => true,
   })
   bridge.start()

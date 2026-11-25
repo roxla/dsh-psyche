@@ -1,4 +1,4 @@
-// P2-Recall R4-B：Recall Receipt（RC-01~40）。
+﻿// P2-Recall R4-B：Recall Receipt（RC-01~40）。
 //
 // 验收口径（用户 m19206 冻结）：
 // - 回执只回答「这次召回问什么、谁被看见、谁被拒、为什么」，不存原文；
@@ -109,7 +109,7 @@ async function fact(
 
 // ── 1. schema v11 ────────────────────────────────────────────────────────
 const version = db.get('PRAGMA user_version')
-eq('RC-01 schema 版本是 31', Number(version?.user_version ?? version?.value ?? 0), 31)
+eq('RC-01 schema 版本是 42', Number(version?.user_version ?? version?.value ?? 0), 42)
 const tables = db.all(
   `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('recall_runs', 'recall_candidates')`,
 )
@@ -118,7 +118,7 @@ const business = db.get(
   `SELECT COUNT(*) AS n FROM sqlite_master
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT GLOB 'fts_index_*' AND name <> 'fts_index'`,
 )
-eq('RC-03 当前业务表70', Number(business?.n ?? 0), 70)
+eq('RC-03 当前业务表81', Number(business?.n ?? 0), 81)
 
 // ── 2. 主动 Recall 生成回执 ─────────────────────────────────────────────
 const SENTINEL_QUERY = '绿皮火车夜行哨兵'

@@ -1,4 +1,4 @@
-import {mkdtempSync} from 'node:fs'
+﻿import {mkdtempSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
@@ -17,9 +17,9 @@ for(const driverPreference of ['node:sqlite','better-sqlite3']) {
  const old=legacy()
  const before=old.db.prepare('SELECT * FROM persona_config').all();old.db.close()
  const {db}=await openDatabase({file:old.file,logger:{},driverPreference})
- eq('v22升级v31',db.userVersion(),31)
- eq('70业务表',db.tableCount(),70)
- eq('40触发器',db.get("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='trigger'").n,40)
+ eq('v22升级v42',db.userVersion(),42)
+ eq('81业务表',db.tableCount(),81)
+ eq('44触发器',db.get("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='trigger'").n,44)
  eq('旧事实不修改',db.all('SELECT * FROM persona_config'),before)
  eq('已有v22迁移仍只一条',db.get('SELECT COUNT(*) AS n FROM schema_migrations WHERE version=22').n,1)
  eq('新调度表无正文列',db.all("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'room_%'").filter(r=>!['room_members','room_message_seq','room_participation_state'].includes(r.name)).every(r=>db.all('PRAGMA table_info('+r.name+')').every(c=>!['text','body','payload_text','message_text'].includes(c.name))),true)

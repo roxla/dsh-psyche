@@ -1,4 +1,4 @@
-// E6-A 双驱动一致性：node:sqlite 与 better-sqlite3 在同一套操作下结果一致。
+﻿// E6-A 双驱动一致性：node:sqlite 与 better-sqlite3 在同一套操作下结果一致。
 //
 // 验收点（用户 E6-A）：
 // 1. 两种驱动都能打开、五项自检全过、迁移到当前版本；
@@ -197,7 +197,7 @@ eq('better-sqlite3 重开后 artifact 数不变', beforeCount(betterScenario), b
 function beforeCount(scenario) {
   return scenario.beforeClose
 }
-eq('重开后版本仍是 31', nodeScenario.userVersion, 31)
+eq('重开后版本仍是 42', nodeScenario.userVersion, 42)
 
 console.log('\n[5] 同一库文件跨驱动互操作')
 {

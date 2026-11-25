@@ -98,7 +98,9 @@ function makeContext(overrides = {}) {
       },
       async resume() {
         calls.resume += 1
-        throw new Error('no session')
+        // 宿主对「没有这个会话」的 reject 带 `session/not-found`，文案里有 not found；
+        // 这里用同样的文案，别用含糊的 'no session'（5cda146 收紧闸门后不再匹配）。
+        throw new Error('session not found: qq-private-10001')
       },
       async create() {
         calls.create += 1
@@ -139,6 +141,8 @@ function makeContext(overrides = {}) {
     adapter,
     logger,
     webSocket: WebSocketCtor,
+    // 旧版 agents.create 只在测试里显式打开；生产装配不再回退到它。
+    allowLegacyAgentCreate: true,
     isSessionBound: () => true,
   })
   bridge.start()

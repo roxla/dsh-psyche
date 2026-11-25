@@ -31,6 +31,15 @@ export interface CaptureInputLike {
   sessionRef?: string
   captureKey?: string | null
   messageId?: string | null
+  /**
+   * 这条消息属于哪一轮（宿主 `turn/start` 的编号）。
+   *
+   * 自动摘要的「8 个有效轮」按它分组：一轮里可以有多条用户消息，也可能
+   * 一条回复都没有，数发言条数两头都会错。拿不到就写 null，读侧按「不算
+   * 有效轮」处理——宁可少算，也不拿别的字段猜（猜错的方向是多算，多算会
+   * 让摘要覆盖到还没聊完的段）。
+   */
+  turnId?: string | null
   origin?: string
   kind?: string
   text?: string | null
@@ -251,12 +260,10 @@ function isInjectionMessage(
   data: Record<string, unknown>,
   source: Record<string, unknown> | null,
 ): boolean {
-  // M06：只读识别旧 Lingban 注入标记，用来排除历史会话里的注入块；
-  // 它不被当作可信 Psyche 注入证明，也不恢复旧工具/服务/接口。
-  const marker = asRecord(source?.psyche) ?? asRecord(source?.lingban)
+  const marker = asRecord(source?.psyche)
   if (marker !== null && marker.injection === 'memory-context') return true
   const id = typeof data.id === 'string' ? data.id : null
-  return id !== null && (id.startsWith('msg_psyche_') || id.startsWith('msg_lingban_'))
+  return id !== null && id.startsWith('msg_psyche_')
 }
 
 export function classifySessionEvent(
@@ -315,6 +322,12 @@ export function normalizeSessionEvent(
     maxText?: number
     /** 从 Host 的可信绑定里取这条会话属于哪个 Contact；取不到就写 null。 */
     resolveSender?: (sessionId: string) => string | null
+    /**
+     * 这一轮是第几轮。`user/message` 本身不带 turn，所以由调用方（CaptureHost）
+     * 跟踪最近的 `turn/start` 再传进来；`assistant/message` 自带 `data.turn`，
+     * 在 classify 之后优先用它。
+     */
+    turn?: number | null
   } = {},
 ): NormalizedCapture | null {
   const sessionId = typeof session?.id === 'string' ? session.id.trim() : ''
@@ -330,6 +343,13 @@ export function normalizeSessionEvent(
   // role 由 classify 决定，origin/kind 只在这里映射一次，避免两个入口给不同值。
   const isUser = classified.role === 'user'
   const source = sourceChannelOfSession(sessionId)
+  // assistant 事件自带 turn；user 事件没有，只能用调用方跟踪到的那个。
+  const dataRecord = asRecord(event?.data)
+  const eventTurn =
+    !isUser && typeof dataRecord?.turn === 'number' && Number.isFinite(dataRecord.turn)
+      ? dataRecord.turn
+      : options.turn ?? null
+  const turnId = typeof eventTurn === 'number' && Number.isFinite(eventTurn) ? `turn-${eventTurn}` : null
   return {
     role: classified.role,
     interrupted: classified.interrupted,
@@ -340,12 +360,13 @@ export function normalizeSessionEvent(
       sessionRef: sessionId,
       captureKey,
       messageId: classified.messageId,
+      turnId,
       origin: isUser ? 'user' : 'self',
       kind: isUser ? 'message' : 'model',
       text: classified.text,
       at,
       metadata: {
-        dsh: { sessionId, seq, role: classified.role, ...(isUser ? {} : { interrupted: classified.interrupted }) },
+        dsh: { sessionId, seq, turn: eventTurn, role: classified.role, ...(isUser ? {} : { interrupted: classified.interrupted }) },
         ...(classified.metadata ?? {}),
       },
     },
@@ -361,6 +382,7 @@ export function normalizeSessionEvent(
 export class CaptureHost {
   #options: CaptureHostOptions
   #queue: CaptureInputLike[] = []
+  readonly #turns = new Map<string, number>()
   #running = false
   #stopped = false
   #stats = {
@@ -383,13 +405,24 @@ export class CaptureHost {
   handle(session: SessionLike | null | undefined, event: SessionEventLike | null | undefined): void {
     if (this.#stopped) return
     this.#stats.received += 1
+    // user/message 的 payload 里没有 turn，只能靠 turn/start 记一笔。
+    // 这条事件不入队：它不是经历，只是给后续消息标个轮次。
+    if (event?.type === 'turn/start') {
+      const turn = Number(asRecord(event.data)?.turn)
+      const id = typeof session?.id === 'string' ? session.id.trim() : ''
+      if (id && Number.isFinite(turn)) this.#turns.set(id, turn)
+      this.#stats.skipped += 1
+      return
+    }
     if (!this.#scopeAllows(session)) {
       this.#stats.skipped += 1
       return
     }
+    const sessionId = typeof session?.id === 'string' ? session.id.trim() : ''
     const normalized = normalizeSessionEvent(session, event, {
       maxText: this.#options.maxText,
       ...(this.#options.resolveSender ? { resolveSender: this.#options.resolveSender } : {}),
+      ...(sessionId && this.#turns.has(sessionId) ? { turn: this.#turns.get(sessionId) ?? null } : {}),
     })
     if (!normalized) {
       this.#stats.skipped += 1

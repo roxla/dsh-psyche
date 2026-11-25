@@ -41,7 +41,7 @@ function eq(label, actual, expected) {
 
 // A 路径脱敏
 eq('A1 Windows 路径换成 <path>', redactAbsolutePaths('打开 D:\\project\\psyche\\data 失败'), '打开 <path> 失败')
-eq('A2 POSIX 路径换成 <path>', redactAbsolutePaths('cannot open /home/test/.dsh/x.db'), 'cannot open <path>')
+eq('A2 POSIX 路径换成 <path>', redactAbsolutePaths('cannot open /home/roxla/.dsh/x.db'), 'cannot open <path>')
 eq('A3 普通文本不变', redactAbsolutePaths('数据库还没准备好'), '数据库还没准备好')
 eq('A4 末段展示', pathLabel('D:\\project\\psyche\\.tmp-p4a4-data'), '.tmp-p4a4-data')
 eq('A5 空路径返回空串', pathLabel(''), '')

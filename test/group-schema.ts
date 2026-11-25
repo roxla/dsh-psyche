@@ -21,10 +21,10 @@ for(const driverPreference of ['node:sqlite','better-sqlite3']){
  const old=legacy();old.room('rm_old');old.source('src_old_a','rm_old','a','2026-11-13T05:00:00.000Z');old.source('src_old_b','rm_old','b','2026-11-13T03:00:00.000Z');old.source('src_unknown',null,'unknown')
  const before=old.db.prepare('SELECT * FROM sources ORDER BY source_id').all();old.db.close()
  const opened=await openDatabase({file:old.file,logger:log,driverPreference});const db=opened.db
- eq('真实v21经v26升级到v31',db.userVersion(),31)
- eq('业务表70',db.tableCount(),70)
- eq('当前触发器40',db.get("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='trigger'").n,40)
- eq('历史Source完全不改写',db.all('SELECT * FROM sources ORDER BY source_id'),before)
+ eq('真实v21经v26升级到v42',db.userVersion(),42)
+ eq('业务表81',db.tableCount(),81)
+ eq('当前触发器44',db.get("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='trigger'").n,44)
+ eq('历史Source完全不改写',db.all('SELECT * FROM sources ORDER BY source_id').map((r)=>{const o={};for(const k of Object.keys(before[0]??{}))o[k]=r[k];return o}),before)
  eq('历史序号按落库顺序而非时间',db.all('SELECT source_id,room_seq FROM room_message_seq ORDER BY room_seq'),[{source_id:'src_old_a',room_seq:1},{source_id:'src_old_b',room_seq:2}])
  eq('缺Room历史不伪造映射',db.get("SELECT COUNT(*) AS n FROM room_message_seq WHERE source_id='src_unknown'").n,0)
  eq('历史水位未伪装已读',db.get('SELECT last_seq,read_through_seq FROM room_participation_state WHERE room_id=?',['rm_old']),{last_seq:2,read_through_seq:0})
@@ -41,7 +41,7 @@ for(const conflict of ['room','message']){
  eq(`${conflict}不删旧Source`,read.prepare('SELECT COUNT(*) AS n FROM sources').get().n,before);read.close()
 }
 {
- const old=legacy();old.db.exec('PRAGMA user_version=32');old.db.close();let rejected=false
+ const old=legacy();old.db.exec('PRAGMA user_version=43');old.db.close();let rejected=false
  try{const value=await openDatabase({file:old.file,logger:log});value.db.close()}catch{rejected=true}
  eq('拒绝读取比实现更新的Schema',rejected,true)
 }

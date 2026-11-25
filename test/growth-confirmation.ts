@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { openDatabase, migrate } from '../packages/core/dist/adapter.js'
 import { reflectGrowthCandidates } from '../packages/core/dist/growth-reflection.js'
+import { buildTools } from '../dist/lib/tools.js'
 import {
   decideGrowthCandidate,
   decisionCandidateStatuses,
@@ -120,7 +121,7 @@ function addFact(db: any, input: { sourceIds: string[]; statement: string; kind?
 async function proposed(db: any, statement = '用户偏好清晨写作'): Promise<{ candidateId: string; hash: string }> {
   const source = addSource(db, { channel: 'web', origin: 'external' })
   addFact(db, { sourceIds: [source], statement })
-  const result = reflectGrowthCandidates(db, { now: T1, perContactDaily: 10, globalDaily: 10, candidateFilter: false })
+  const result = reflectGrowthCandidates(db, { minBatch: 1, now: T1, perContactDaily: 10, globalDaily: 10, candidateFilter: false })
   if (result.status !== 'proposed') throw new Error(`expected proposed, got ${result.status}`)
   const row = db.prepare("SELECT candidate_id FROM growth_candidates WHERE status='proposed' LIMIT 1").get() as { candidate_id: string }
   return { candidateId: row.candidate_id, hash: growthCandidateContentHash(db, row.candidate_id).hash }
@@ -140,6 +141,8 @@ function cleanup(): void {
 {
   const db = await freshDb()
   const { candidateId, hash } = await proposed(db)
+  // 三段变化的第一段：候选还在 proposed，投影里不该有它。
+  eq('before confirm projection empty', readConfirmedGrowthChanges(db).length, 0)
   const first = decideGrowthCandidate(db, { candidateId, decision: 'confirm', decidedBy: OWNER, expectedHash: hash })
   eq('confirm ok', first.idempotent, false)
   const row = db.prepare('SELECT status FROM growth_candidates WHERE candidate_id=?').get(candidateId) as { status: string }
@@ -192,7 +195,7 @@ function cleanup(): void {
   const snapshot = db.prepare('SELECT statement FROM growth_candidates WHERE candidate_id=?').get(candidateId) as { statement: string }
   const source = addSource(db, { channel: 'web', origin: 'external', independence: 'ind_second', at: T2 })
   addFact(db, { sourceIds: [source], statement: '用户偏好清晨写作', at: T2 })
-  const again = reflectGrowthCandidates(db, { now: new Date(Date.parse(T2) + 60_000), perContactDaily: 10, globalDaily: 10, candidateFilter: false })
+  const again = reflectGrowthCandidates(db, { minBatch: 1, now: new Date(Date.parse(T2) + 60_000), perContactDaily: 10, globalDaily: 10, candidateFilter: false })
   eq('new evidence -> new proposed', again.status, 'proposed')
   const confirmed = db.prepare('SELECT statement FROM growth_candidates WHERE candidate_id=?').get(candidateId) as { statement: string }
   eq('confirmed candidate untouched', confirmed.statement, snapshot.statement)
@@ -220,7 +223,7 @@ function cleanup(): void {
   const db = await freshDb()
   const source = addSource(db, { channel: 'private', sender: 'ct_a', origin: 'user' })
   addFact(db, { sourceIds: [source], statement: '用户最近在准备搬家' })
-  const result = reflectGrowthCandidates(db, { now: T1, perContactDaily: 10, globalDaily: 10, candidateFilter: false })
+  const result = reflectGrowthCandidates(db, { minBatch: 1, now: T1, perContactDaily: 10, globalDaily: 10, candidateFilter: false })
   eq('contact candidate proposed', result.status, 'proposed')
   const row = db.prepare("SELECT candidate_id, scope FROM growth_candidates LIMIT 1").get() as { candidate_id: string; scope: string }
   eq('candidate scope contact', row.scope, 'contact:ct_a')
@@ -254,6 +257,96 @@ function cleanup(): void {
   eq('confirm targets proposed', decisionCandidateStatuses('confirm'), ['proposed'])
   eq('reject targets proposed', decisionCandidateStatuses('reject'), ['proposed'])
   eq('withdraw targets confirmed/withdrawn', decisionCandidateStatuses('withdraw'), ['confirmed', 'withdrawn'])
+}
+
+// 10. 工具层：从注册出去的正式 handler 走一遍 proposed → confirmed → withdrawn。
+//     Core 的行为上面已经验过；这一段看的是「用户实际能摸到的入口」有没有接错。
+{
+  const db = await freshDb()
+  const { candidateId, hash } = await proposed(db)
+  const core = {
+    growthCandidates: async (limit?: number) => {
+      const rows = listGrowthCandidates(db, { limit: limit ?? 5 }) as Array<{
+        candidateId: string
+        type: string
+        statement: string
+        independentCount?: number
+      }>
+      return {
+        ok: true,
+        total: rows.length,
+        items: rows.map((row) => ({
+          candidateId: row.candidateId,
+          type: row.type,
+          statement: row.statement,
+          independentCount: row.independentCount ?? 0,
+          hash: growthCandidateContentHash(db, row.candidateId).hash,
+        })),
+      }
+    },
+    growthDecide: async (id: string, decision: string, expectedHash: string) =>
+      decideGrowthCandidate(db, {
+        candidateId: id,
+        decision: decision as 'confirm' | 'reject' | 'withdraw',
+        decidedBy: OWNER,
+        expectedHash,
+      }),
+  } as never
+  const tools = buildTools(core) as unknown as Array<{
+    name: string
+    execute: (args: unknown) => Promise<unknown>
+    output: { render: (args: unknown, value: unknown) => { type: string; text: string }[] }
+  }>
+  const candidatesTool = tools.find((tool) => tool.name === 'psyche_growth_candidates')
+  const decideTool = tools.find((tool) => tool.name === 'psyche_growth_decide')
+  ok('两个成长工具都注册了', candidatesTool !== undefined && decideTool !== undefined)
+
+  const listed = (await candidatesTool!.execute({ limit: 5 })) as {
+    items?: Array<{ candidateId?: string; hash?: string }>
+  }
+  eq('工具列出的一条候选就是它', listed.items?.[0]?.candidateId, candidateId)
+  eq('工具给出的 hash 与 Core 一致', listed.items?.[0]?.hash, hash)
+  eq('确认前投影为空', readConfirmedGrowthChanges(db).length, 0)
+
+  const confirmed = (await decideTool!.execute({
+    candidate_id: candidateId,
+    decision: 'confirm',
+    hash,
+  })) as { decision?: string; idempotent?: boolean }
+  eq('工具确认成功', confirmed.decision, 'confirm')
+  eq('确认后投影一条', readConfirmedGrowthChanges(db).length, 1)
+  ok(
+    '确认的渲染说的是「已确认」',
+    decideTool!.output.render({}, confirmed)[0]?.text?.includes('已确认') === true,
+  )
+
+  const replayed = (await decideTool!.execute({ candidate_id: candidateId, decision: 'confirm', hash })) as {
+    idempotent?: boolean
+  }
+  eq('重放幂等', replayed.idempotent, true)
+  eq(
+    '重放不新增决策行',
+    Number((db.prepare('SELECT COUNT(*) AS n FROM growth_confirmations').get() as { n: number }).n),
+    1,
+  )
+
+  const withdrawn = (await decideTool!.execute({
+    candidate_id: candidateId,
+    decision: 'withdraw',
+    hash,
+  })) as { decision?: string }
+  eq('工具撤回成功', withdrawn.decision, 'withdraw')
+  eq('撤回后投影为空', readConfirmedGrowthChanges(db).length, 0)
+  eq(
+    '撤回不删账本',
+    Number((db.prepare('SELECT COUNT(*) AS n FROM growth_confirmations').get() as { n: number }).n),
+    2,
+  )
+
+  const noHash = (await decideTool!.execute({ candidate_id: candidateId, decision: 'reject' })) as {
+    ok?: boolean
+  }
+  eq('缺 hash 被工具拒绝', noHash.ok, false)
 }
 
 cleanup()

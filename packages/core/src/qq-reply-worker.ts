@@ -22,6 +22,13 @@ export interface QqReplyWorkerStore {
   }): QqReplyOutboxRow[]
   applyResult(replyId: string, result: ChatSendResult, now?: string): QqReplyOutboxRow | undefined
   expireDue?(now?: string): number
+  /**
+   * 第 53 轮 P1-A：真正调用 `transport.send` 之前的第二次复核。
+   *
+   * 返回稳定原因码表示不许发（提醒已被取消/已终态、队列行已被别的路径结算）。
+   * 实现方负责把该行就地收敛，Worker 拿到非 null 只停手，不再写回结果。
+   */
+  recheckForSend?(replyId: string, now?: string): string | null
 }
 
 export interface QqReplyWorkerLogger {
@@ -121,6 +128,15 @@ export class QqReplyWorker {
       const target = this.#targetOf(row)
       if (target === null) {
         this.store.applyResult(row.replyId, { outcome: 'permanent', errorCode: 'target-unresolved' }, this.#now())
+        return
+      }
+      // 领取到发送之间用户可能取消：发送前再确认一次，拦住就不发（提醒零调用）。
+      const blocked = this.store.recheckForSend?.(row.replyId, this.#now()) ?? null
+      if (blocked !== null) {
+        this.#logger?.warn('[psyche][qq] 发送前复核未通过，已停发', {
+          replyId: row.replyId,
+          reason: blocked,
+        })
         return
       }
       let result: ChatSendResult

@@ -81,7 +81,7 @@ const artifactId = fact.artifactId
 ok('fact 落出结论', Boolean(artifactId), fact)
 eq('结论归属到桌面联系人', db.all(`SELECT subject_refs FROM artifact_revisions WHERE artifact_id = ?`, [artifactId])[0].subject_refs, JSON.stringify([contactId]))
 
-eq('v31 user_version', db.all('PRAGMA user_version')[0].user_version, 31)
+eq('v42 user_version', db.all('PRAGMA user_version')[0].user_version, 42)
 await rejects(
   '语义字段 UPDATE 仍被拒绝（statement）',
   Promise.resolve().then(() => db.run(`UPDATE artifact_revisions SET statement = '改掉' WHERE artifact_id = ?`, [artifactId])),

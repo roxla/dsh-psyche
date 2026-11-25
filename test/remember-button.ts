@@ -81,11 +81,11 @@ const core = new Core({ db, config: {}, logger: log, dataDir: dir })
 const now = new Date().toISOString()
 db.run(
   `INSERT INTO contacts (contact_id, persona_id, platform, stable_user_id, created_at, updated_at)
-   VALUES ('ct_a', 'main', 'qq', '10001', ?, ?)`,
+   VALUES ('ct_a', 'main', 'qq', '695115698', ?, ?)`,
   [now, now],
 )
 
-const SESSION = 'qq-private-10001'
+const SESSION = 'qq-private-695115698'
 
 function userEvent(seq: number, messageId: string, text: string): RememberSessionEvent {
   // 真实 DSH 的 `user/message` 事件：data 本身就是 UserMessage，不带 message 包一层。
@@ -126,7 +126,7 @@ function deps(events: RememberSessionEvent[], binding: { contactId: string | nul
       read: () =>
         ({
           platform: 'qq',
-          stableUserId: '10001',
+          stableUserId: '695115698',
           contactId: binding.contactId,
           groupId: binding.groupId ?? null,
           channelId: null,
@@ -273,26 +273,6 @@ await throws('E_NOT_FOUND', 'T10a 只有注入块时拒绝', () =>
   rememberAssistantMessage(deps([injection, assistantEvent('m-a10', '好的。')]), {
     sessionId: SESSION,
     assistantMessageId: 'm-a10',
-  }),
-)
-
-// T10b：旧 Lingban 来源标记只读识别，仍不能当作用户原话
-const legacyInjection = {
-  seq: 9,
-  type: 'user/message',
-  data: {
-    message: {
-      id: 'msg_lingban_legacy',
-      role: 'user',
-      content: [{ type: 'text', text: '<memory-context>旧注入。</memory-context>' }],
-      source: { kind: 'user', lingban: { injection: 'memory-context' } },
-    },
-  },
-} satisfies RememberSessionEvent
-await throws('E_NOT_FOUND', 'T10b 旧版注入块同样拒绝', () =>
-  rememberAssistantMessage(deps([legacyInjection, assistantEvent('m-a10b', '好的。')]), {
-    sessionId: SESSION,
-    assistantMessageId: 'm-a10b',
   }),
 )
 

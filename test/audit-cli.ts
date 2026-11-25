@@ -82,7 +82,7 @@ check('integrity 缺参数退出码 3', integrityNoArgs.status === 3, String(int
 const after = await openDatabase({ file: join(dataDir, 'memory.sqlite3') })
 const version = after.db.get<{ user_version: number }>('PRAGMA user_version')?.user_version
 after.db.close()
-check('跑完审计后库仍是 v31（未被迁移或改写）', Number(version) === 31, version)
+check('跑完审计后库仍是 v42（未被迁移或改写）', Number(version) === 42, version)
 
 try {
   rmSync(root, { recursive: true, force: true })

@@ -96,14 +96,17 @@ const passTransport = (): boolean => true
 
 // ---- B. enqueue / 幂等 / 冲突 / 参数 ----
 {
-  const first = store.enqueue(base(A.contactId, 1, '第一条'))
+  const first = store.enqueue({ ...base(A.contactId, 1, '第一条'), accessEpoch: 5 })
   eq('B1 首次入队 duplicate=false', first.duplicate, false)
   eq('B2 pending', first.row.status, 'pending')
   eq('B3 replyId 稳定', first.row.replyId, replyIdOf('main', A.contactId, `qq-private-${A.contactId}`, 1))
   eq('B4 textHash', first.row.textHash, hashReplyText('第一条'))
   eq('B5 TTL 30 分钟', Date.parse(first.row.expiresAt) - clock, QQ_REPLY_TTL_MS)
+  // 12a / 迁移 36：代次随行落库，重放沿用原值（不因重放被改写）。
+  eq('B5a 入队时给的代次能读回', first.row.accessEpoch, 5)
 
   const again = store.enqueue(base(A.contactId, 1, '第一条'))
+  eq('B5b 重放沿用同一行（代次不被改写）', again.row.accessEpoch, 5)
   eq('B6 同内容幂等 duplicate=true', again.duplicate, true)
   eq('B7 幂等不新增', store.list('pending').length, 1)
   rejects('B8 同 seq 不同内容冲突', QQ_REPLY_ERROR.conflict, () => store.enqueue(base(A.contactId, 1, '第二条')))
@@ -319,7 +322,7 @@ const passTransport = (): boolean => true
   const counts = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM contacts`)?.n ?? 0
   ok('K1 contacts 保留', counts >= 3)
   const version = db.get<{ v: number }>(`SELECT user_version AS v FROM pragma_user_version`)?.v
-  eq('K2 schema v31', version, 31)
+  eq('K2 schema v42', version, 42)
 }
 
 console.log(`\n[qq-reply-outbox] ${passed} 通过 ${failed} 失败`)

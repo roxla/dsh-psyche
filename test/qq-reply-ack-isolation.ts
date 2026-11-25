@@ -70,6 +70,7 @@ function harness() {
       adapter: { announce: () => {}, forget: () => {}, size: () => 0 },
       logger: { info() {}, error() {}, warn(text: string) { warnings.push(text) } },
       webSocket: Socket,
+      allowLegacyAgentCreate: true,
       isSessionBound: () => true,
       setTimeout: (callback: () => void) => {
         timers.push(callback)

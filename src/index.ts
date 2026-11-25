@@ -1,7 +1,7 @@
 // 心灵（Psyche）· DeepSeek Harness 插件入口 · P1 核心
 //
 // 职责：只做「装配 + 转发」——Config Schema、Runtime（库/日志/偏好/用量）、boot、
-//   12 个工具的注册、systemPrompt 段落热挂摘、webServer 六条路由、ctx.psyche 服务。
+//   11 个工具的注册、systemPrompt 段落热挂摘、webServer 六条路由、ctx.psyche 服务。
 //   业务判定一律在 lib/store.ts / lib/panel.ts，本文件不写业务 SQL、不碰状态机。
 // 约束：status/panel/usage/ops/sea 五条读路由只读，不写库、不改 profile；
 //   写口只有 /prefs（视图偏好）与 ops 的三个动作，且每次写都落一条日志。
@@ -24,7 +24,52 @@ import { nowIso, openDatabase } from './lib/adapter.js'
 import { rebuildFtsIndex, verifyFtsIndex } from './lib/fts.js'
 import { markInterruptedRecallRuns } from './lib/recall-receipt.js'
 import type { Db, DbHealth, DbLogger, OpenAttempt, SelfCheck } from './lib/adapter.js'
-import { Core, PHASE_LABELS, formatConfirmedGrowthLine, projectMoodTone, readConfirmedGrowthChanges } from './lib/store.js'
+import { Core, PHASE_LABELS, decideGrowthCandidate, formatConfirmedGrowthLine, growthCandidateContentHash, listGrowthCandidates, planDigestJob, projectMoodTone, readConfirmedGrowthChanges } from './lib/store.js'
+import { resumeDigestOnStartup } from './lib/digest-resume.js'
+import { cancelReminder, createReminder, enqueueReminderReply, listReminders } from './lib/store.js'
+import { NO_REPLY_WINDOW_AT, createReminderDelivery } from './lib/reminder-delivery.js'
+import { isOwnerReminderScope as isOwnerReminderScopeByScope, readOwnerUin } from './lib/reminder-owner.js'
+import { resolveReminderDelivery as resolveReminderDeliveryByFacade } from './lib/reminder-resolve.js'
+import { ReminderTicker } from './lib/reminder-ticker.js'
+import { loadAccessEpochs, saveAccessEpochs } from './lib/store.js'
+import { beginAccessEpochChange, commitAccessEpochChange, loadPendingEpochs } from './lib/store.js'
+import { ensureProductDataDir } from './lib/product-isolation.js'
+
+/**
+ * 提醒行 → 工具层视图。刻意丢掉 persona_id / request_id / contact_id：
+ * 模型只需要判断「什么时候、提醒什么、现在什么状态」，
+ * 内部记账字段露出去只会被它当成可引用的内容。
+ */
+function reminderView(row: {
+  reminder_id: string
+  due_at: string
+  text: string
+  status: string
+  delivery_state: string
+  created_at: string
+  channel?: 'desktop' | 'qq'
+  next_attempt_at?: string | null
+}): {
+  reminderId: string
+  dueAt: string
+  text: string
+  status: string
+  deliveryState: string
+  createdAt: string
+  channel?: 'desktop' | 'qq'
+  nextAttemptAt: string | null
+} {
+  return {
+    reminderId: row.reminder_id,
+    dueAt: row.due_at,
+    text: row.text,
+    status: row.status,
+    deliveryState: row.delivery_state,
+    createdAt: row.created_at,
+    channel: row.channel,
+    nextAttemptAt: row.next_attempt_at ?? null,
+  }
+}
 import { startQqGroupRuntime } from './lib/qq-group-runtime.js'
 import type { GroupScheduler } from './lib/group-scheduler.js'
 import type { CaptureInput, ResolveContactInput } from './lib/store.js'
@@ -34,7 +79,6 @@ import { buildPanel } from './lib/panel.js'
 import type { PanelPayload } from './lib/panel.js'
 import { readPrefs, writePrefs } from './lib/prefs.js'
 import type { PanelPrefs } from './lib/prefs.js'
-import { ensureProductDataDir } from './lib/product-isolation.js'
 import { buildSeaScene, resolveSeaWindow } from './lib/sea.js'
 import { buildNodeDetail } from './lib/node-detail.js'
 import { createArchive, listArchiveRows } from './lib/archive.js'
@@ -65,6 +109,23 @@ import { buildInitRoutes } from './lib/init-routes.js'
 import { buildGrantRoutes } from './lib/grant-routes.js'
 import { buildInjectionRoutes } from './lib/injection-routes.js'
 import { registerRememberRoutes } from './lib/remember-routes.js'
+import { registerProjectHandoffRoutes } from './lib/project-handoff-routes.js'
+import { buildProjectBrief } from './lib/project-brief.js'
+import { buildConversationRecall } from './lib/conversation-recall.js'
+import {
+  buildRecallMessage,
+  delegationOfAgent,
+  extractRecallQuery,
+  sourceKindOf,
+  stripRecallBlocks,
+  textOfContent,
+  type RecallQuery,
+} from './lib/pre-step-recall.js'
+import { ingestAffectSignal } from 'dsh-psyche-core'
+import { planAffectContact } from './lib/affect-contact.js'
+import { briefPlatformFor, isDelegatedAgent, resolveSessionChannel } from './lib/session-channel.js'
+import { AssemblyReceiptStore } from './lib/assembly-receipt.js'
+import type { ChannelBinding } from './lib/session-channel.js'
 import type { RememberPersistence } from './lib/remember-button.js'
 import { PRESET_IDS, loadPresets } from './lib/presets.js'
 import { CaptureHost } from './lib/capture-host.js'
@@ -79,9 +140,28 @@ import { QqBridge } from './lib/qq-bridge.js'
 import { createQqTransport } from './lib/qq-transport.js'
 import { qqGroupAllowed } from './lib/qq-group-admission.js'
 import { QqLogBuffer, buildQqAdminPayload, formatQqLogLine } from './lib/qq-admin.js'
+import { buildPendingReminders } from './lib/pending-reminders.js'
 import { canExportDiagnostics, parseQqDiagnosticFilter } from './lib/qq-diagnostics.js'
 import { ManagedProcess } from './lib/managed-process.js'
 import { QqControlCenter } from './lib/qq-control-center.js'
+import {
+  buildQqWorkspaceCard,
+  readWorkspaceCardWithRetry,
+  type QqWorkspaceAttempt,
+  type QqWorkspaceCard,
+} from './lib/qq-workspace-card.js'
+import { readWorkspaceBaseline } from './lib/qq-workspace-read.js'
+import {
+  defaultSessionsDirs,
+  findExistingQqSessionCwd,
+  isQualifiedWorkspacePath,
+  resolveQqWorkspaceCwd,
+} from './lib/qq-workspace-path.js'
+import { attachQqSessionToWorkspace, type QqWorkspaceEntityLike } from './lib/qq-workspace-attach.js'
+import { sameOriginWrite } from './lib/qq-request-origin.js'
+import { createQqModelCatalog } from './lib/qq-model-catalog.js'
+import { QqSettingsOverlay } from './lib/qq-settings-overlay.js'
+import type { LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { inspectSnowlumaDir } from './lib/snowluma.js'
 import { spawn } from 'node:child_process'
 import { createQqAdapter } from 'dsh-psyche-qq'
@@ -288,7 +368,7 @@ export interface PsycheConfig {
     provider: string
     /** 创建 Agent 时使用的 model。 */
     model: string
-    /** QQ 会话所属工作区目录（`cwd`）；留空时用 `<dataDir 同级>/QQ 聊天`。 */
+    /** QQ 会话所属工作区目录（`cwd`）；留空时先用磁盘上已有 QQ 会话的目录，没有才用 `<宿主工作目录>/QQ 聊天`，相对值按宿主工作目录补全。 */
     cwd: string
     /** 断线重连间隔（毫秒，指数退避到 30 秒）。 */
     reconnectMs: number
@@ -464,7 +544,7 @@ const ConfigSchema = z.object({
       snowlumaHome: z.string().default('').description('SnowLuma 安装目录（含 config/onebot_<QQ>.json）；留空不做 token 发现'),
       provider: z.string().default('').description('创建 QQ Agent 时使用的 provider（沿用宿主模型路由）'),
       model: z.string().default('').description('创建 QQ Agent 时使用的 model'),
-      cwd: z.string().default('').description('QQ 会话所属工作区目录；留空用 <dataDir 同级>/QQ 聊天'),
+      cwd: z.string().default('').description('QQ 会话所属工作区目录；留空先用磁盘上已有 QQ 会话的目录，没有才用 <宿主工作目录>/QQ 聊天（相对值按宿主工作目录补全）'),
       reconnectMs: z.number().min(200).max(60000).default(3000).description('断线重连初始间隔（毫秒，指数退避到 30 秒）'),
       maxText: z.number().min(100).max(100000).default(8000).description('单条消息正文上限（字符）'),
       groups: (z as unknown as { any: () => Schema<unknown> }).any().default({ enabled:false,allowed:[] }).description('群白名单与确定性回复（D-2）：采集/回复默认关闭；回复需受信模型输入证明能力'),
@@ -825,7 +905,7 @@ function createServiceClass(runtime: Runtime) {
  * @param config 已按 ConfigSchema 校验过的配置；整段禁用时宿主可能传 undefined。
  * @returns void——同步返回，真正的初始化在后台 boot 里跑。
  *
- * 副作用：建目录、开库、注册 12 个工具、挂 6 条路由、注册 systemPrompt 段落，
+ * 副作用：建目录、开库、注册 11 个工具、挂 6 条路由、注册 systemPrompt 段落，
  * 外加一个卸载时关库的 effect。任何一步失败都只写进 `runtime.bootError`，
  * 不向宿主抛——插件加载抛异常会连累整个 profile，启动问题必须降级成页面上的提示。
  * 可能抛的错误：只有 effect 注册本身（宿主已拆）会抛，其余都被吞进日志。
@@ -883,8 +963,6 @@ export function apply(ctx: Context, config: PsycheConfig): void {
     const boot = async (): Promise<Runtime> => {
       const dataDir = await resolveDataDir(cfg.dataDir)
       runtime.dataDir = dataDir
-      // 产品归属门禁：必须在写 config-audit、应用恢复与打开 SQLite 之前。
-      // 旧 Lingban 目录/无标识数据库在这里被拒绝，避免 Psyche 误接管。
       ensureProductDataDir(dataDir)
       // C 阶段：把生效策略与「被忽略的旧配置」落一行审计（只追加）。
       writeConfigAudit(dataDir, cfg, logger)
@@ -999,9 +1077,22 @@ export function apply(ctx: Context, config: PsycheConfig): void {
       } catch (error) {
         logger.warn?.(`[psyche] FTS5 一致性检查失败（不影响启动）：${errorText(error)}`)
       }
+      // ── P0-B2：启动恢复摘要积压 ────────────────────────────────────────
+      // 进程可能在「摘要已提交、续排还没落库」之间退出，留下的积压不会再有人补。
+      // 实现在 `src/lib/digest-resume.ts`（抽出去是为了让测试能调用宿主真正走的这一段），
+      // 内部按同一套资格判定（绑定仍活动 + 项目 active + 自动模式开）补出真正缺的那一条：
+      // 幂等，不建定时器、不调用模型、不发消息。
+      //
+      // 「自动模式」开关属于 AM-1，本批尚未落到配置上；在它出现之前按开启处理，
+      // 参数已经接好，等开关落地只改调用点。
+      resumeDigestOnStartup({
+        db: opened.db as never,
+        now: new Date(),
+        autoEnabled: true,
+        log: (line) => logger.info?.(line),
+      })
       // 自检不通过也不阻止启动：缺的只是某项能力（例如 FTS 不可用），降级能用好过整个不可用。
-      if (!opened.selfCheck.ok) {
-        const failed = opened.selfCheck.items
+      if (!opened.selfCheck.ok) {        const failed = opened.selfCheck.items
           .filter((item) => !item.ok)
           .map((item) => `${item.name}: ${item.detail}`)
         logger.warn?.(`[psyche] 能力自检有问题：${failed.join('；')}`)
@@ -1204,6 +1295,23 @@ export function apply(ctx: Context, config: PsycheConfig): void {
   // 通过 `adapter.announce()` 提交声明，不接触 RuntimeInputStore.bind()。
   const qqAdapter = createQqAdapter()
   let qqBridge: QqBridge | null = null
+  /**
+   * P1-C：回复队列的 store 句柄。工具侧要用它做 `unknown` 的人工裁决
+   * （`resolveUnknownByReminder`），而它是随桥接一起构造的，所以留个引用；
+   * outbox 没启用时为 null，裁决工具会如实说「当前没有可用队列」。
+   */
+  let replyOutboxStore: QqReplyOutboxStore | null = null
+  /**
+   * 桥接最近一次的启动错误。
+   *
+   * `qqBridge === null` 有两种完全不同的原因：配置里没开（正常），
+   * 和构造函数抛错（故障）。面板过去只看 `qqBridge !== null`，
+   * 两者都显示成「QQ 通道没有启用」——故障就伪装成了「你没开」。
+   */
+  let qqStartError: string | null = null
+  let bridgeFailedEpoch = 0
+  // 提醒派发器：桥接就绪后才 start()，桥接重建时先 stop() 再换新的。
+  let reminderTicker: ReminderTicker | null = null
   let groupScheduler: GroupScheduler | null = null
   let groupStarting: Promise<GroupScheduler|null> | null = null
   let groupRuntimeClosed=false
@@ -1213,6 +1321,78 @@ export function apply(ctx: Context, config: PsycheConfig): void {
   // P8：本机独立控制中心。只管理自己启动的 SnowLuma 子进程；默认不启用、无匿名路由。
   let qqControl: QqControlCenter | null = null
   let qqManager: ManagedProcess | null = null
+  /** Q1：QQ 访问控制与默认模型的插件覆盖层；数据目录不可写时为 null。 */
+  let qqOverlay: QqSettingsOverlay | null = null
+  /**
+   * Q5-E：组装回执。只在内存里，不落库、不升 Schema。
+   * 有了它，「召回到了但被预算裁掉」和「根本没召回」才分得开。
+   */
+  const assemblyReceipts = new AssemblyReceiptStore({ perSession: 20, total: 200 })
+  /** 最近一次原话召回的明细，供回执读取（同一轮内同步写入，不会串）。 */
+  /**
+   * 召回结果按会话存，不是全局一份。
+   *
+   * 第 37 轮外部评审 P2（11）：「回执用共享最近值 + sessionId 关联，并行可丢、同会话可误挂上轮」。
+   * 真机复现：用户会话 `session-1cf1920b` 的三条回执里，`recallSourceIds` 挂的是我这边
+   * `session-6d420bb0` 的召回来源——两个会话同时在跑，最后一次写 wins。
+   *
+   * 改成按会话 id 存：pre-step 写自己那条，Composer 组装时取自己那条。
+   * 侧栏并行、子代理并行都不会串。
+   */
+  const recallMetaBySession = new Map<
+    string,
+    {
+      sourceIds: string[]
+      sessionRef: string | null
+      skipped: string | null
+      /** Q5-F：这一轮是怎么判定的（ok / delegated / no-user-input / unresolved）。 */
+      status: string | null
+      queryMode: 'none' | 'continue' | 'specific' | null
+      /** 命中的本轮用户消息 id，便于与回执对照。 */
+      messageId: string | null
+      at: number
+    }
+  >()
+  /** 同轮只注入一次召回；按 (会话, 轮) 记，重入时不再重复追加。 */
+  const recallTurnSeen = new Map<string, number>()
+  /**
+   * Q5 渠道判定：回答「谁在问」时要知道 Owner 是谁。优先取插件覆盖层的有效值
+   * （管理员可能在控制中心改过），覆盖层不可用时退回宿主配置。取不到就是空串，
+   * `resolveSessionChannel` 会把 QQ 私聊判成 other、读不到跨侧内容。
+   *
+   * 提前到这里是因为 pre-step 的日常召回也要用它，而它原先定义在
+   * systemPrompt 注入块内部。
+   */
+  const ownerUin = (): string =>
+    readOwnerUin({
+      overlay: qqOverlay,
+      host: config.qq?.allowFrom,
+      runtime: {
+        provider: config.qq?.provider ?? '',
+        model: config.qq?.model ?? '',
+      },
+      onCorrupt: (reason) => {
+        // 第 57 轮 P1-D：覆盖文件损坏时**不**退回宿主值——坏配置期间 QQ 侧不授予 Owner，
+        // 否则名单里残留的旧号可能借宿主旧值拿到主人权限。桌面侧不受影响。
+        // 第 20 轮追加：顺手把桥标成不可信，否则桥可能还在「上一次读是好的」的状态里。
+        if (qqBridge !== null) qqBridge.markConfigUntrusted(reason)
+      },
+      trusted: () => qqBridge === null || qqBridge.configTrust().trusted,
+    })
+  /**
+   * P1-C 第 16 轮：判断「现在这个会话是不是主人本人在说话」——只有主人能裁决 unknown 投递。
+   * 判据与失败关闭口径见 `lib/reminder-owner.ts`（那边有单测）。
+   */
+  const isOwnerReminderScope = (
+    db: { get?: <T>(sql: string, params?: readonly (string | number | null)[]) => T | undefined },
+    receiver: { channel: 'qq' | 'desktop'; contactId?: string | null },
+  ): boolean => isOwnerReminderScopeByScope(db, receiver, ownerUin())
+  /** 最近一次项目 Brief 读到的 Checkpoint，供回执读取。 */
+  let lastBriefMeta: { checkpointId: string | null; revision: number | null; sessionId: string | null } = {
+    checkpointId: null,
+    revision: null,
+    sessionId: null,
+  }
   let snowlumaOverride: string | null = null
   const qqSnowlumaDir = (): string => snowlumaOverride ?? cfg.qq?.snowlumaHome ?? ''
   const openLocalUrl = (url: string): void => {
@@ -1230,13 +1410,419 @@ export function apply(ctx: Context, config: PsycheConfig): void {
 
   // P8-FINAL：QQ 页内嵌控制中心。只把带 fragment 令牌的 loopback URL 返回给同源页面，
   // 由 iframe 自己读取 fragment；不在父页面展示令牌，不打开外部浏览器窗口。
+  // Q1：默认模型目录来自宿主 `llm` 服务。它可能晚于本插件注册，所以这里只取引用，
+  // 真正查询放到控制中心 GET /api/model 时再走；服务缺失时模型页显示「目录不可用」
+  // 并禁用保存，而不是给一个能填但校验不了的表单。
+  let llmApi: LlmRuntime | null = null
+  const injectLlm = ctx.inject.bind(ctx) as (
+    deps: string[],
+    callback: (llmCtx: Context) => void,
+  ) => unknown
+  injectLlm(['llm'], (llmCtx) => {
+    llmApi = (llmCtx as unknown as { llm: LlmRuntime }).llm
+  })
+
+  // 归档是 Workspace 级状态：被归档的会话在 `agent/pre-step` 就被 Host 的
+  // `ArchivedSessionGate` 拒掉——消息投进去了却没有回应，桥接只会看到
+  // 「投递成功」然后永远等不到 assistant/message。QQ 会话归桥接独占管理，
+  // 所以每个入站消息投递前都先确保它不在归档名单里。
+  type WorkspaceControllerLike = {
+    unarchiveSession?: (request: { sessionId: string }) => Promise<unknown>
+    create?: (request: { path: string }) => Promise<{
+      workspace: { workspaceId: string; title: string }
+      created: boolean
+    }>
+    rename?: (request: { workspaceId: string; title: string }) => Promise<unknown>
+    insertSessionBefore?: (request: {
+      workspaceId: string
+      sessionId: string
+      beforeSessionId?: string
+    }) => Promise<unknown>
+    /**
+     * 宿主没有 `workspace/list`（HTTP 方法表里确认过），唯一的读取面是这条流：
+     * 每代先给一份完整 baseline，再给增量。工作区卡只取第一帧就断开。
+     */
+    follow?: (signal: AbortSignal) => AsyncIterable<WorkspaceFollowFrameLike>
+  }
+  type WorkspaceViewLike = {
+    workspaceId: string
+    path: string
+    title: string
+    sessionIds: string[]
+  }
+  type WorkspaceFollowFrameLike =
+    | { type: 'baseline'; value: { items: WorkspaceViewLike[] } }
+    | { type: 'replace'; value: { items: WorkspaceViewLike[] } }
+    | { type: 'upsert'; workspace: WorkspaceViewLike }
+    | { type: 'remove'; workspaceId: string }
+    | { type: 'order'; workspaceIds: string[] }
+    | { type: 'archived'; archivedSessionIds: string[] }
+    | { type: 'pinned'; pinnedSessionIds: string[] }
+  // session/create 同时带 workspaceId 与 sessionId 时，宿主会接受我们给的 id 并把
+  // 它登记进该工作区（真机验证：返回 { sessionId: 'qq-private-probe-b-1' }，
+  // workspace.json 里该工作区 members 出现这一条）。用它把桥接自己造的会话补进账目。
+  type SessionsLike = {
+    create?: (request: {
+      workspaceId?: string
+      cwd?: string
+      sessionId?: string
+      agentPreset?: string
+    }) => Promise<{ sessionId: string }>
+  }
+  let sessionsApi: SessionsLike | null = null
+  let workspaceApi: WorkspaceControllerLike | null = null
+  /**
+   * 工作区注册表。宿主的两条路里，只有实体上的 `attachSession` 能把**账外**会话
+   * 补挂进工作区（`workspace/insertSessionBefore` 只做已登记会话的排序，账外会话
+   * 直接被拒 `the session is not accounted`）。RPC 面没有 attach，所以只能注入服务。
+   */
+  type WorkspaceRegistryLike = {
+    resolveByPath?: (path: string) => Promise<QqWorkspaceEntityLike | undefined>
+  }
+  let workspaceRegistryApi: WorkspaceRegistryLike | null = null
+  injectLlm(['workspaceRegistry'], (rctx) => {
+    workspaceRegistryApi =
+      (rctx as unknown as { workspaceRegistry?: WorkspaceRegistryLike }).workspaceRegistry ?? null
+  })
+  injectLlm(['workspaceController'], (wctx) => {
+    workspaceApi =
+      (wctx as unknown as { workspaceController?: WorkspaceControllerLike }).workspaceController ?? null
+  })
+  injectLlm(['sessionController'], (sctx) => {
+    sessionsApi = (sctx as unknown as { sessionController?: SessionsLike }).sessionController ?? null
+  })
+
+  // 宿主只在 `workspace/create` 时登记工作区条目：只给会话写 `meta.cwd` 的话，
+  // 侧栏会把它归到「未分组」。dsh-qq 的做法是先建工作区、首次创建后改名，
+  // 再把会话挂进去——这里照做，历史会话也会在下次投递时被搬回去。
+  let qqWorkspaceId: string | null = null
+  /**
+   * 等 `workspaceController` 服务就绪。
+   *
+   * 启动补归属那一刻，宿主可能还没把这个服务注入进来；直接返回会让历史会话
+   * 一直留在「未分组」，所以短暂等一会儿（最多约 3 秒）。
+   */
+  const waitWorkspaceApi = async (): Promise<WorkspaceControllerLike | null> => {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      if (workspaceApi !== null) return workspaceApi
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    return workspaceApi
+  }
+  /** 等 `sessionController` 服务就绪（原因同上：插件可能先于服务注入完成注册）。 */
+  const waitSessionsApi = async (): Promise<SessionsLike | null> => {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      if (sessionsApi !== null) return sessionsApi
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    return sessionsApi
+  }
+  /** 等 `workspaceRegistry` 服务就绪（历史会话补挂唯一的入口，值得等这一下）。 */
+  const waitWorkspaceRegistry = async (): Promise<WorkspaceRegistryLike | null> => {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      if (workspaceRegistryApi !== null) return workspaceRegistryApi
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    return workspaceRegistryApi
+  }
+  /** 记录工作区补登/新建走到哪一步；宿主不落文本日志，只能自己写文件留证据。 */
+  const noteWorkspaceStep = (sessionId: string, cwd: string, step: string): void => {
+    try {
+      writeFileSync(
+        join(dirname(cwd), 'qq-workspace-probe.json'),
+        JSON.stringify(
+          {
+            at: new Date().toISOString(),
+            sessionId,
+            cwd,
+            step,
+            workspaceApi: workspaceApi !== null,
+            sessionsApi: sessionsApi !== null,
+            workspaceId: qqWorkspaceId,
+          },
+          null,
+          2,
+        ),
+        'utf8',
+      )
+    } catch {
+      // 留证据失败不能影响主流程。
+    }
+  }
+  // 工作区卡：宿主的 HTTP 方法表里**没有** `workspace/list`（只有 create/rename/
+  // insertSessionBefore/follow 等），所以「宿主实际名 + 成员数」只能靠 `workspace/follow`
+  // 的 baseline 读一眼就断开。读不到就如实标「未核实」，不拿缓存猜。
+  const QQ_WORKSPACE_TITLE = 'QQ 聊天'
+  let qqWorkspaceCwd: string | null = null
+  let qqWorkspaceCwdSource: 'config' | 'default' | 'unknown' = 'unknown'
+  let qqWorkspaceAttempt: QqWorkspaceAttempt | null = null
+  /**
+   * 回执版本号：每次登记 +1。
+   *
+   * `attempt.at` 只有毫秒精度，同一会话在同一毫秒里重新登记会得到同一个时间戳；
+   * 补读核对「还是不是同一份回执」需要时间戳之外的判据（GPT 第 34 轮）。
+   */
+  let qqWorkspaceAttemptSeq = 0
+  let qqWorkspaceInFlight = 0
+  /** 「查工作区 → 建工作区」的单次执行锁：并发到达的消息共用同一个 promise。 */
+  let qqWorkspaceSetup: Promise<string | null> | null = null
+  /**
+   * 记一次登记尝试。
+   *
+   * `sessionId` 只在**会话级**动作（建会话、补挂、排序）上给：卡要用它核对「这条会话
+   * 到底在不在成员里」（GPT 第 31 轮）。建工作区、改名不针对任何会话，给了就是假回执。
+   */
+  const recordWorkspaceAttempt = (
+    step: string,
+    ok: boolean,
+    error?: string,
+    sessionId?: string,
+  ): void => {
+    qqWorkspaceAttemptSeq += 1
+    qqWorkspaceAttempt = {
+      at: new Date().toISOString(),
+      step,
+      ok,
+      seq: qqWorkspaceAttemptSeq,
+      ...(error === undefined ? {} : { error }),
+      ...(sessionId === undefined ? {} : { sessionId }),
+    }
+  }
+  /** 路径比较：斜杠/反斜杠、大小写、末尾分隔符都不该让同一个目录判成两个。 */
+  const workspacePathKey = (path: string): string =>
+    path.replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase()
+  /** 读一次宿主工作区 baseline；`follow` 缺失、超时或没拿到有效帧返回 null（≠ 空清单）。 */
+  const readWorkspaceViews = async (): Promise<WorkspaceViewLike[] | null> => {
+    const api = await waitWorkspaceApi()
+    const follow = api?.follow
+    if (follow === undefined) return null
+    return await readWorkspaceBaseline((signal) => follow.call(api, signal), {
+      timeoutMs: 800,
+      onError: (error) => logger.warn?.(`[psyche][qq] 读工作区清单失败：${String(error)}`),
+    })
+  }
+  const currentQqWorkspace = async (): Promise<{
+    items: WorkspaceViewLike[] | null
+    found: WorkspaceViewLike | null
+  }> => {
+    const items = await readWorkspaceViews()
+    if (items === null || qqWorkspaceCwd === null) return { items, found: null }
+    const wanted = workspacePathKey(qqWorkspaceCwd)
+    return { items, found: items.find((item) => workspacePathKey(item.path) === wanted) ?? null }
+  }
+  /**
+   * 读一次清单并判一张卡。
+   *
+   * `readAt` 记的是**发起**时刻，判「读回是否早于登记」要用它；`priorMisses` 是此前
+   * 已经有过几次「登记之后发起、且都没看到目标会话」的有效读回（第 32 轮：第一次缺席
+   * 只算还没看到，第二次仍缺席才是矛盾）。
+   */
+  const buildWorkspaceCardOnce = async (priorMisses = 0): Promise<QqWorkspaceCard> => {
+    const readAt = new Date().toISOString()
+    const { items, found } = await currentQqWorkspace()
+    return buildQqWorkspaceCard({
+      cwd: qqWorkspaceCwd,
+      cwdSource: qqWorkspaceCwdSource,
+      expectedTitle: QQ_WORKSPACE_TITLE,
+      serviceAvailable: workspaceApi?.create !== undefined,
+      inFlight: qqWorkspaceInFlight > 0,
+      attempt: qqWorkspaceAttempt,
+      actual:
+        found === null
+          ? null
+          : {
+              workspaceId: found.workspaceId,
+              title: found.title,
+              path: found.path,
+              memberCount: found.sessionIds.length,
+              sessionIds: found.sessionIds,
+            },
+      read: items === null ? 'unavailable' : 'ok',
+      readAt,
+      priorMisses,
+      checkedAt: new Date().toISOString(),
+    })
+  }
+  /**
+   * 工作区卡。
+   *
+   * 第 31/32 轮：补读策略在 `readWorkspaceCardWithRetry()` 里（纯函数、可测）——
+   * 读回早于登记的缺席不算数，第二次有效缺席才报 `needs-review`；两次读之间目标换了
+   * 就丢弃旧核验，按新目标重新核验。第 35 轮：每次读取前后都比一次回执版本（目标 + `seq`），
+   * 期间变了就整份作废。
+   */
+  const qqWorkspaceCard = async (): Promise<QqWorkspaceCard> =>
+    readWorkspaceCardWithRetry(
+      (priorMisses) => buildWorkspaceCardOnce(priorMisses),
+      () => qqWorkspaceAttempt,
+    )
+  /** 内嵌编辑表单唯一的写动作：改显示名。目录与配置来源只读展示。 */
+  const renameQqWorkspace = async (title: string): Promise<QqWorkspaceCard> => {
+    const api = await waitWorkspaceApi()
+    if (api?.rename === undefined) throw new Error('宿主没有提供 workspace/rename')
+    const { found } = await currentQqWorkspace()
+    const workspaceId = found?.workspaceId ?? qqWorkspaceId
+    if (workspaceId === null) throw new Error('宿主里还没有 QQ 工作区，先让一条 QQ 消息把它建出来')
+    await api.rename({ workspaceId, title })
+    recordWorkspaceAttempt('renamed', true)
+    return await qqWorkspaceCard()
+  }
+  /**
+   * 确保「QQ 聊天」工作区存在，返回它的 id（服务不可用或目录建不出来时返回 null）。
+   *
+   * 宿主的 `workspace/create` 会先 realpath 这个路径，目录不存在就直接 invalid-path；
+   * 早期版本只把 cwd 写进 meta、从未建过目录，所以这里必须先落盘。
+   */
+  const ensureQqWorkspaceRoot = async (cwd: string, sessionId: string): Promise<string | null> => {
+    // 同一时刻只执行一次「查已有工作区 → 建工作区」：两条 QQ 消息几乎同时到达时，
+    // 如果各查各建，就会产出两个同路径工作区（GPT 第 2 轮第 1 条）。
+    if (qqWorkspaceSetup !== null) return await qqWorkspaceSetup
+    const run = (async (): Promise<string | null> => {
+      qqWorkspaceInFlight += 1
+      try {
+        // 非全限定路径一定过不了宿主的 realpath 校验，没必要送去撞一次——
+        // 就地记成 invalid-cwd，卡上会显示「需人工核对」，也不会留下半成品工作区。
+        if (!isQualifiedWorkspacePath(cwd)) {
+          noteWorkspaceStep(sessionId, cwd, 'invalid-cwd')
+          recordWorkspaceAttempt('invalid-cwd', false, `工作区路径不是绝对路径：${cwd}`, sessionId)
+          return null
+        }
+        const api = await waitWorkspaceApi()
+        noteWorkspaceStep(sessionId, cwd, api === null ? 'workspace-api-missing' : 'workspace-api-ready')
+        if (api?.create === undefined) {
+          recordWorkspaceAttempt('workspace-api-missing', false, undefined, sessionId)
+          return null
+        }
+        try {
+          mkdirSync(cwd, { recursive: true })
+        } catch (error) {
+          logger.warn?.(`[psyche][qq] 创建工作区目录失败：${cwd}（${String(error)}）`)
+          recordWorkspaceAttempt('mkdir', false, String(error))
+          return null
+        }
+        if (qqWorkspaceId === null) {
+          // 先按目录找已有的：workspace/create 成功但 session/create 失败后重试、
+          // 或插件重启把内存里的 id 丢了，都不该再建一个同路径的工作区（GPT 第 1 轮第 1 条：
+          // 非幂等重试会产生重复工作区）。找到就复用，不再 create。
+          let views = await readWorkspaceViews()
+          if (views === null) views = await readWorkspaceViews()
+          if (views === null) {
+            // follow 超时或 baseline 读不到时，不能据此推断「工作区不存在」——
+            // 宁可这次失败，也不拿一次失败的读取去 create（GPT 第 2 轮第 1 条）。
+            recordWorkspaceAttempt('workspace/read', false, '读取宿主工作区清单失败')
+            throw new Error('读取宿主工作区清单失败，这次先不创建工作区')
+          }
+          const wanted = workspacePathKey(cwd)
+          const existing = views.find((item) => workspacePathKey(item.path) === wanted) ?? null
+          if (existing !== null) {
+            qqWorkspaceId = existing.workspaceId
+            recordWorkspaceAttempt('reused', true)
+            return qqWorkspaceId
+          }
+          let value: Awaited<ReturnType<NonNullable<WorkspaceControllerLike['create']>>>
+          try {
+            value = await api.create({ path: cwd })
+          } catch (error) {
+            recordWorkspaceAttempt('workspace/create', false, String(error))
+            throw error
+          }
+          qqWorkspaceId = value.workspace.workspaceId
+          if (value.created && api.rename !== undefined) {
+            try {
+              await api.rename({ workspaceId: qqWorkspaceId, title: QQ_WORKSPACE_TITLE })
+            } catch (error) {
+              // 标题重复等情况不影响使用：工作区已经建好，只是名字没改成。
+              // 记成失败，卡上会显示「需人工核对」，用户可以就地改名。
+              logger.warn?.(`[psyche][qq] 工作区改名失败：${String(error)}`)
+              recordWorkspaceAttempt('rename', false, String(error))
+              return qqWorkspaceId
+            }
+          }
+          recordWorkspaceAttempt(value.created ? 'created' : 'reused', true)
+        }
+        return qqWorkspaceId
+      } finally {
+        qqWorkspaceInFlight -= 1
+      }
+    })()
+    qqWorkspaceSetup = run
+    try {
+      return await run
+    } finally {
+      qqWorkspaceSetup = null
+    }
+  }
+  const ensureQqWorkspace = async (sessionId: string, cwd: string): Promise<void> => {
+    const workspaceId = await ensureQqWorkspaceRoot(cwd, sessionId)
+    const registry = await waitWorkspaceRegistry()
+    const api = workspaceApi
+    const result = await attachQqSessionToWorkspace({
+      workspaceId,
+      sessionId,
+      cwd,
+      ...(registry?.resolveByPath === undefined
+        ? {}
+        : { resolveWorkspace: (path: string) => registry.resolveByPath!(path) }),
+      ...(api?.insertSessionBefore === undefined
+        ? {}
+        : {
+            insertSessionBefore: (request: { workspaceId: string; sessionId: string }) =>
+              api.insertSessionBefore!(request),
+          }),
+    })
+    if (result.status === 'attached') {
+      // 顺序没调成不影响归属，只是新会话排到了末尾；如实记一步，卡上可查。
+      recordWorkspaceAttempt(result.ordered ? 'attached' : 'attached-unordered', true, undefined, sessionId)
+      noteWorkspaceStep(sessionId, cwd, result.ordered ? 'session-attached' : 'session-attached-unordered')
+      return
+    }
+    // 补挂失败就是补挂失败：不退到 insertSessionBefore（它对账外会话只会再失败一次），
+    // 也不假装成功。卡上会显示「需人工核对」并带上阶段与原因。
+    logger.warn?.(`[psyche][qq] 会话补挂工作区失败（${result.stage}）：${result.error}`)
+    recordWorkspaceAttempt(`attach:${result.stage}`, false, result.error, sessionId)
+    noteWorkspaceStep(sessionId, cwd, `session-attach-failed:${result.stage}`)
+  }
+
+  /**
+   * 按固定 id 建 QQ 会话（`createSessionThroughControllers` 的生产实现）。
+   *
+   * 先把「QQ 聊天」工作区确保出来，再让宿主的 `session/create` 带着 workspaceId 与
+   * 我们给的 sessionId 建会话：宿主会同时建出 Agent 并登记进工作区（真机实测，
+   * 返回后 `session/state` 就是 active 的活 Agent），不再出现「agents.create 造出来
+   * 的会话不在宿主账目里」那种账外会话。
+   *
+   * @returns 宿主实际使用的会话 id，由桥接核对是不是我们要的那个。
+   */
+  const createQqSession = async (sessionId: string, cwd: string): Promise<string> => {
+    const workspaceId = await ensureQqWorkspaceRoot(cwd, sessionId)
+    if (workspaceId === null) throw new Error('workspaceController 不可用，无法把 QQ 会话登记进工作区')
+    const sessions = await waitSessionsApi()
+    if (sessions?.create === undefined) throw new Error('sessionController 不可用，无法按指定 id 建会话')
+    let created: { sessionId: string }
+    try {
+      created = await sessions.create({ workspaceId, sessionId })
+    } catch (error) {
+      recordWorkspaceAttempt('session/create', false, String(error), sessionId)
+      throw error
+    }
+    recordWorkspaceAttempt('session/create', true, undefined, sessionId)
+    noteWorkspaceStep(sessionId, cwd, 'session-created')
+    return created.sessionId
+  }
+
   const ensureQqControl = async (): Promise<QqControlCenter> => {
     const dataDir = runtime.dataDir || (await resolveDataDir(cfg.dataDir))
     if (qqManager === null) qqManager = new ManagedProcess('snowluma')
+    if (qqOverlay === null) {
+      qqOverlay = new QqSettingsOverlay({ file: join(dataDir, 'qq-overrides.json'), logger })
+    }
     if (qqControl === null) {
+      const overlay = qqOverlay
       qqControl = new QqControlCenter({
         stateDir: join(dataDir, 'qq-control'),
         manager: qqManager,
+        // Q5-E：把组装回执接到控制中心，这样「提示里到底放了什么」可查。
+        receipts: assemblyReceipts,
         snowlumaDir: qqSnowlumaDir,
         setSnowlumaDir: (dir) => {
           snowlumaOverride = dir
@@ -1249,6 +1835,32 @@ export function apply(ctx: Context, config: PsycheConfig): void {
         },
         openBrowser: openLocalUrl,
         logger,
+        // Q1：访问控制与默认模型的写入入口。宿主只读展示，写入在这里完成，
+        // 因为这里已经有 loopback + 一次性令牌 + Origin/Host 校验。
+        workspace: {
+          snapshot: () => qqWorkspaceCard(),
+          rename: (title: string) => renameQqWorkspace(title),
+        },
+        settings: {
+          overlay,
+          hostAccess: () => config.qq?.allowFrom,
+          hostModel: () => ({ provider: config.qq?.provider ?? '', model: config.qq?.model ?? '' }),
+          apply: (snapshot) => {
+            qqBridge?.applyAccess(snapshot.hasAccessOverride ? snapshot.access : null)
+            qqBridge?.applyModelSelection(snapshot.hasModelOverride ? snapshot.modelSelection : null)
+            // 第二批：时段规则和名单一样，保存后立刻让发送路径用新值。
+            qqBridge?.applyReplySchedules(snapshot.replySchedules)
+            // 第 57 轮 P1-D：保存成功即代表覆盖层重新可信（三组一起完整校验过）。
+            qqBridge?.markConfigTrusted()
+          },
+          // 迁移 37：控制中心在写覆盖文件之前先走这一步。记不下来就整次变更作废，
+          // 磁盘上不会留下「文件改了、没人记得变更没走完」的状态。
+          prepareAccess: (access) => {
+            qqBridge?.beginAccessChange(access)
+          },
+          reapplyAccess: () => qqBridge?.reapplyAccess() ?? { ok: true, peers: [] },
+          catalog: createQqModelCatalog(() => llmApi),
+        },
       })
     }
     return qqControl
@@ -1294,10 +1906,24 @@ export function apply(ctx: Context, config: PsycheConfig): void {
       // 不传就落到 sessions/_no-cwd（界面上看不见工作区，也不好归档）。
       // 注意：DSH 会校验 cwd 目录必须真实存在，否则 turn 直接报
       // `working-directory: directory does not exist`，所以先建目录。
-      const qqCwd =
-        qqConfig.cwd !== ''
-          ? qqConfig.cwd
-          : join(dirname(runtime.dataDir), 'QQ 聊天')
+      // 路径必须是全限定的：宿主 `workspace/create` 会先 realpath，非绝对路径直接
+      // 报 `Workspace path is not fully qualified`，工作区建不出来、会话就留在未分组。
+      // 这里统一走 resolveQqWorkspaceCwd：配置 → 磁盘上已有 QQ 会话的 cwd → 宿主工作
+      // 目录。中间的「已有会话目录」很关键——宿主按会话 header 的 cwd 归属工作区，历史
+      // QQ 会话的 cwd 早就定死在当时解析出来的绝对路径（本机是 D:\project\psyche\QQ 聊天），
+      // 而插件进程的工作目录在升级后变成了 %USERPROFILE%\.dsh\profiles\<profile>，
+      // 只按 process.cwd() 推会把新旧会话劈成两组。
+      const existingQqCwd = findExistingQqSessionCwd({
+        sessionsDirs: defaultSessionsDirs(runtime.dataDir),
+      })
+      const qqCwd = resolveQqWorkspaceCwd({
+        configured: qqConfig.cwd,
+        existing: existingQqCwd,
+        cwd: process.cwd(),
+      })
+      // 工作区卡要如实说这个目录是从配置里读的，还是按默认规则推出来的。
+      qqWorkspaceCwd = qqCwd
+      qqWorkspaceCwdSource = qqConfig.cwd !== '' ? 'config' : 'default'
       mkdirSync(qqCwd, { recursive: true })
       let bridge:QqBridge
       const ensureGroupRuntime=async(target:Core,isActive:()=>boolean):Promise<GroupScheduler|null>=>{
@@ -1357,6 +1983,20 @@ export function apply(ctx: Context, config: PsycheConfig): void {
           adapter: qqAdapter,
           // 消息投递前确认 Host 已完成身份绑定，避免 Capture 先于绑定写 null。
           isSessionBound: (sessionId) => runtimeInputs.read(sessionId) !== null,
+          // 被归档的会话在 Host 的 `agent/pre-step` 直接被拒，桥接这边只会看到
+          // 「投递成功」然后永远等不到回复。走 Host 的正式接口恢复，不直接改存储文件。
+          unarchiveSession: async (sessionId) => {
+            const api = workspaceApi
+            if (api?.unarchiveSession === undefined) return
+            await api.unarchiveSession({ sessionId })
+          },
+          // 让 QQ 会话落在「QQ 聊天」工作区：只写 meta.cwd 会掉进「未分组」。
+          ensureSessionWorkspace: async (sessionId) => {
+            await ensureQqWorkspace(sessionId, qqCwd)
+          },
+          // 全新 QQ 会话的生产创建路径：workspace/create + session/create 按固定 id 建，
+          // 宿主当场发布活 Agent 并把它登记进工作区（真机实测），不再出现账外会话。
+          createSessionThroughControllers: (sessionId) => createQqSession(sessionId, qqCwd),
           ingestGroupMessage: async (input, isActive) => {
             const target = await core()
             if(!isActive()||groupRuntimeClosed)return null
@@ -1367,6 +2007,68 @@ export function apply(ctx: Context, config: PsycheConfig): void {
             return result
           },
           onGroupConnectionGap:()=>groupScheduler?.noteInboundGap(),
+          // 第二批（GPT 第 2 轮裁定 a）：时段外的独立私聊采集。只写 Source + Event，
+          // 不建回复轮、不排队、不发送——「时段外不进记忆」是不允许的。
+          ingestPrivateMessage: async (input) => {
+            const target = await core()
+            const result = await target.ingestPrivateMessage(input)
+            return { sourceId: result.sourceId, eventId: result.eventId, replayed: result.replayed }
+          },
+          // 采集开关跟着宿主走：关掉自动采集时，时段外这条独立路径也不许写记忆。
+          captureEnabled: cfg.capture?.enabled === true,
+          // 迁移 36：授权代次的策略侧持久化。不注入的话重启后代次归零，而任务行
+          // 上的 access_epoch 还停在旧值，所有在途回复都会被判 access-superseded——
+          // 表现为「重启之后他就不理我了」。库不可用时返回空/丢弃，由桥接保持内存行为。
+          accessEpochStore: {
+            load: () => {
+              const db = runtime.db
+              if (db === null) return new Map()
+              try {
+                return loadAccessEpochs(db as unknown as Parameters<typeof loadAccessEpochs>[0], 'main')
+              } catch (error) {
+                logger.warn?.('[psyche][qq] 授权代次读取失败')
+                return new Map()
+              }
+            },
+            save: (epochs) => {
+              const db = runtime.db
+              if (db === null) return
+              saveAccessEpochs({
+                db: db as unknown as Parameters<typeof saveAccessEpochs>[0]['db'],
+                personaId: 'main',
+                epochs,
+                now: new Date().toISOString(),
+              })
+            },
+            // 迁移 37 两阶段提交：先把「打算涨到几代」落盘，再改名单，最后提交并清标记。
+            // 这样做是为了覆盖「撤销 → 重新授权 → 代次写失败 → 重启」这个组合：
+            // 只看覆盖文件会以为是新名单、只看库会看到旧代次，两者拼起来正好把旧任务放回来。
+            begin: (targets) => {
+              const db = runtime.db
+              if (db === null) throw new Error('数据库不可用，无法记录待完成的授权变更')
+              beginAccessEpochChange({
+                db: db as unknown as Parameters<typeof beginAccessEpochChange>[0]['db'],
+                personaId: 'main',
+                targets,
+                now: new Date().toISOString(),
+              })
+            },
+            commit: (epochs) => {
+              const db = runtime.db
+              if (db === null) throw new Error('数据库不可用，无法提交授权代次')
+              commitAccessEpochChange({
+                db: db as unknown as Parameters<typeof commitAccessEpochChange>[0]['db'],
+                personaId: 'main',
+                epochs,
+                now: new Date().toISOString(),
+              })
+            },
+            loadPending: () => {
+              const db = runtime.db
+              if (db === null) return new Map()
+              return loadPendingEpochs(db as unknown as Parameters<typeof loadPendingEpochs>[0], 'main')
+            },
+          },
           // 显式注入定时器：桥内部创建发送超时计时器后需要能清理，
           // 否则每次成功发送都会在 10 秒后多打一条「回复发送超时」的误报。
           setTimeout: (fn, ms) => setTimeout(fn, ms),
@@ -1399,22 +2101,117 @@ export function apply(ctx: Context, config: PsycheConfig): void {
           waitConnected: (timeoutMs) => bridge.transportWaitConnected(timeoutMs),
         }),
       )
+      // Q1：应用插件覆盖层（如果有），让第一次连上就用有效名单而不是宿主旧值。
+      // 第 57 轮 P1-D：覆盖文件坏了**不再**退回宿主配置继续发——整份校验失败就无法可靠
+      // 识别哪些对象原本被暂停，退回旧名单等于让主人设的暂停悄悄失效。改为把桥标记成
+      // 「配置不可信」：入站不回复、出站返回 config-corrupt、队列保持等待，直到文件被还原。
+      // 这里不 await 解析数据目录：能走到这一步说明 boot 已经把它解析好了。
+      const applyQqOverlay = (origin: 'boot' | 'recheck'): boolean => {
+        const hostAccess = qqConfig.allowFrom
+        const hostModel = { provider: qqConfig.provider, model: qqConfig.model }
+        if (qqOverlay === null) {
+          const dirForOverlay = runtime.dataDir
+          if (dirForOverlay === '') return bridge.configTrust().trusted
+          qqOverlay = new QqSettingsOverlay({ file: join(dirForOverlay, 'qq-overrides.json'), logger })
+        }
+        try {
+          const snapshot = qqOverlay.effective(hostAccess, hostModel)
+          // 第 20 轮：运行中每秒都会走一次校验。已经可信且配置没变时不重复应用，
+          // 免得 applyAccess 无谓地推进授权代次、把在途行打成「过了代次」。
+          if (origin === 'recheck' && bridge.configTrust().trusted) return true
+          // 只有三组一起完整校验通过并应用之后才解除暂停（第 19 轮第 3 条）。
+          if (snapshot.hasAccessOverride) bridge.applyAccess(snapshot.access)
+          if (snapshot.hasModelOverride) bridge.applyModelSelection(snapshot.modelSelection)
+          bridge.applyReplySchedules(snapshot.replySchedules)
+          bridge.markConfigTrusted()
+          return true
+        } catch (error) {
+          bridge.markConfigUntrusted(errorText(error))
+          if (origin === 'boot') {
+            logger.warn?.(`[psyche][qq] 覆盖配置不可信，QQ 收发已暂停：${errorText(error)}`)
+          }
+          return false
+        }
+      }
+      const recheckQqOverlay = (): boolean => applyQqOverlay('recheck')
+      applyQqOverlay('boot')
+      // 配置可信性检查入口：桥内节流 1 秒，每次入站/出站都试一次，所以
+      // ①文件还原后无需重启；②文件在运行中被改坏也能立刻发现（不等重启）。
+      bridge.setConfigRecheck(recheckQqOverlay)
       bridge.start()
+      // 早期版本创建 QQ 会话时只写了 meta.cwd、没登记工作区，它们会留在侧栏
+      // 「未分组」。启动时按库里出现过的 QQ 会话 id 补一次归属：幂等，失败只告警。
+      void core()
+        .then(async (target) => {
+          if (qqBridge !== bridge) return
+          const rows = target.db.all<{ session_ref: string }>(
+            "SELECT DISTINCT session_ref FROM sources WHERE session_ref LIKE 'qq-%'",
+          )
+          for (const row of rows) {
+            if (qqBridge !== bridge) return
+            await ensureQqWorkspace(row.session_ref, qqCwd)
+          }
+        })
+        .catch((error) => {
+          logger.warn?.(`[psyche][qq] 补历史会话的工作区归属失败：${errorText(error)}`)
+        })
       // P4-B-4-2b：默认关闭；开启时由 Outbox Worker 独占私聊回复发送。
       if (qqConfig.replyOutbox.enabled) {
         void core().then((target) => {
           if (qqBridge !== bridge) return
-          bridge.attachReplyOutbox(
-            new QqReplyOutboxStore({ db: target.db, ownerId: 'main' }),
-            { enabled: true },
-          )
+          const store = new QqReplyOutboxStore({
+            db: target.db,
+            ownerId: 'main',
+            // P1-B：提醒行撞上安静时段要延后而不是取消。普通对话回复不走这里。
+            // P1-D 第 20 轮：这里同时充当「发送前重读配置」的触发点——Worker 领取时读的是
+            // 排队前的缓存结论，文件可能在那之后被改坏。重读一次，坏了就退化成暂停。
+            nextAllowedAt: (row, now) => {
+              recheckQqOverlay()
+              const current = qqBridge
+              if (current === null) return null
+              current.recheckConfigNow()
+              const at = current.nextPrivateSendAt(row.stableUserId, new Date(now))
+              if (at === null) return null
+              // 规则暂停 / 八天内无窗口 / 配置不可信：用远未来占位，行停在等待态而不是被判死。
+              return at === 'paused' ? NO_REPLY_WINDOW_AT : at.toISOString()
+            },
+          })
+          replyOutboxStore = store
+          bridge.attachReplyOutbox(store, { enabled: true })
         }).catch(() => logger.warn?.('[psyche][qq] replyOutbox 初始化失败，助手回复将由 Worker 之外路径兜底'))
       }
       qqBridge = bridge
+      // 提醒派发：桥接就绪后才开始扫——扫出来的行要立刻能进 QQ 队列，
+      // 所以 transportId 必须已经存在，否则那一轮只会空转到下一分钟。
+      void core()
+        .then((target) => {
+          if (qqBridge !== bridge) return
+          const delivery = createReminderDelivery({
+            db: target.db as never,
+            personaId: 'main',
+            ownerId: 'main',
+            bridge: () => {
+              const current = qqBridge
+              if (current === null) return null
+              // 桥接没连上时 transportId 为空，delivery 自己会跳过整轮；这里只做类型上的收窄。
+              return current
+            },
+            enqueue: (input) => enqueueReminderReply(input as never),
+          })
+          reminderTicker?.stop()
+          reminderTicker = new ReminderTicker({
+            tick: delivery.tick,
+            onError: (error) => logger.warn?.(`[psyche][reminder] 扫描失败：${errorText(error)}`),
+          })
+          reminderTicker.start()
+        })
+        .catch(() => logger.warn?.('[psyche][reminder] 派发器初始化失败，到点提醒不会自动送出'))
       // Recovery is independent of a new message; no previous submitted Turn/intent is resent.
       void core().then(target=>ensureGroupRuntime(target,()=>!groupRuntimeClosed&&qqBridge===bridge)).catch(()=>logger.warn?.('[psyche][group] GROUP_START_UNAVAILABLE'))
     } catch (error) {
       logger.warn?.(`[psyche] QQ 通道启动失败：${String(error)}`)
+      qqStartError = errorText(error)
+      bridgeFailedEpoch += 1
       qqBridge = null
     }
   })
@@ -1475,6 +2272,7 @@ export function apply(ctx: Context, config: PsycheConfig): void {
         void groupScheduler?.stop().catch(()=>logger.warn?.('[psyche][group] GROUP_STOP_FAILED'))
         void qqBridge.stop()
         qqBridge = null
+        replyOutboxStore = null
       }
     }
   }, 'dsh-psyche.runtime-bindings()')
@@ -1496,6 +2294,90 @@ export function apply(ctx: Context, config: PsycheConfig): void {
       recall: async (args, scope) => (await core()).recall(args, scope),
       fetch: async (ids, budget) => (await core()).fetch(ids, budget),
       context: async () => (await core()).context(),
+      // G5 提醒：三件事都要求接收者身份，缺了直接拒绝（不兜底记到 Owner 名下）。
+      createReminder: async (input) => {
+        const db = runtime.db
+        if (!db) return { ok: false, status: 'no-receiver', reason: '记忆库还没准备好' }
+        if (!input.receiver) return { ok: false, status: 'no-receiver', reason: '这个会话没有可归属的接收者' }
+        const result = createReminder({
+          db: db as never,
+          personaId: 'main',
+          receiver: input.receiver,
+          dueAt: input.dueAt,
+          timezone: input.timezone,
+          text: input.text,
+          requestId: input.requestId,
+          now: input.now,
+        })
+        return { ok: result.status === 'created' || result.status === 'replayed', status: result.status, reminder: result.reminder ? reminderView(result.reminder) : undefined, reason: result.reason }
+      },
+      listReminders: async (limit, receiver) => {
+        const db = runtime.db
+        if (!db || !receiver) return { ok: true, items: [], total: 0 }
+        const rows = listReminders({ db: db as never, personaId: 'main', receiver, limit })
+        return { ok: true, items: rows.map(reminderView), total: rows.length }
+      },
+      cancelReminder: async (reminderId, now, receiver) => {
+        const db = runtime.db
+        if (!db || !receiver) return { ok: false, status: 'no-permission' }
+        const result = cancelReminder({ db: db as never, personaId: 'main', reminderId, receiver, now })
+        return { ok: result.status === 'cancelled' || result.status === 'replayed', status: result.status, reminder: result.reminder ? reminderView(result.reminder) : undefined }
+      },
+      /**
+       * P1-C：`unknown` 的人工出口。只有 Owner（本机 `ownerId === 'main'`）能裁决，
+       * 且必须能拿到这条提醒（接收者身份与归属都核对）——普通联系人即使是接收人也不行。
+       */
+      resolveReminderDelivery: async ({ reminderId, verdict, receiver, now }) => {
+        const db = runtime.db
+        if (!db || !receiver) return { ok: false, status: 'no-permission' as const }
+        const store = replyOutboxStore
+        // 归属核对：提醒必须挂在当前会话的接收者上，否则连裁决入口都不给。
+        const owned =
+          store !== null &&
+          listReminders({ db: db as never, personaId: 'main', receiver, limit: 50 }).some(
+            (row) => row.reminder_id === reminderId,
+          )
+        return resolveReminderDeliveryByFacade({
+          reminderId,
+          verdict,
+          now,
+          deps: {
+            // 第 16 轮第 3 条：身份看渠道，不看「这条提醒在不在你能看见的列表里」——
+            // 普通联系人本来就是接收人。未启用队列时 store 为 null，门面返回 unavailable。
+            isOwner: isOwnerReminderScope(db as never, receiver),
+            owned,
+            store: store as never,
+            ownerId: 'main',
+          },
+        })
+      },
+      // 人格成长：确认是这条候选进入投影的唯一入口。没有这两个方法，
+      // 候选会永远停在 proposed，`readConfirmedGrowthChanges` 读到的永远是空。
+      growthCandidates: async (limit) => {
+        const db = runtime.db
+        if (!db) return { ok: true, total: 0, items: [] }
+        const rows = listGrowthCandidates(db as never, { status: 'proposed', limit: limit ?? 5 })
+        const items = rows.slice(0, 10).map((row) => ({
+          candidateId: row.candidateId,
+          type: row.type,
+          statement: row.statement,
+          independentCount: row.independentCount,
+          hash: growthCandidateContentHash(db as never, row.candidateId).hash,
+        }))
+        return { ok: true, total: items.length, items }
+      },
+      growthDecide: async (candidateId, decision, hash) => {
+        const db = runtime.db
+        if (!db) return { ok: false, decision: 'confirm', candidateId, idempotent: false }
+        const normalized = decision === 'confirm' || decision === 'reject' || decision === 'withdraw' ? decision : 'reject'
+        const result = decideGrowthCandidate(db as never, {
+          candidateId,
+          decision: normalized,
+          decidedBy: 'user',
+          expectedHash: hash,
+        })
+        return { ok: true, decision: result.decision, candidateId: result.candidateId, idempotent: result.idempotent }
+      },
     },
     {
       // R3：主动 Recall 的 Scope 只从宿主的 Agent → RuntimeInput 绑定里取。
@@ -1519,6 +2401,20 @@ export function apply(ctx: Context, config: PsycheConfig): void {
           groupId: input.groupId ?? null,
           surface,
         }
+      },
+      // G5：提醒的接收者。QQ 会话按联系人，桌面会话按会话标识；
+      // 两者都取不到就返回 null，工具层会拒绝登记——宁可让模型说「记不了」，
+      // 也不要落一条没人认领的提醒。
+      reminderScope: (exec) => {
+        const agent = (exec as { agent?: { id?: string; session?: { id?: string } } } | undefined)?.agent
+        const sessionId = agent?.session?.id ?? null
+        const input = runtimeInputs.readForAgent(agent ?? null)
+        const platform = (input?.platform ?? '').toLowerCase()
+        const contactId = input?.contactId ?? null
+        if (platform === 'qq') {
+          return contactId && sessionId ? { channel: 'qq' as const, contactId, sessionRef: sessionId } : null
+        }
+        return sessionId ? { channel: 'desktop' as const, sessionRef: sessionId } : null
       },
     },
   )
@@ -1545,9 +2441,33 @@ export function apply(ctx: Context, config: PsycheConfig): void {
       .split(',')
       .map((item) => item.trim())
       .filter(Boolean)
+  // G2-A 接入层：每写进一条 Source 就看一次「这个绑定的连续前缀够不够 8 轮」。
+  // 放在这里而不是 turn/end 上，是因为宿主的 turn/end 不保证带正文、而助手正文
+  // 落库才意味着这一轮真的完整了。planDigestJob 自己是幂等的（同一区间只会建一个
+  // 任务），所以重复调用无害；拿不到 db 或该会话没绑项目就直接跳过。
+  const maybePlanDigest = (sessionRef: string): void => {
+    const db = runtime.db
+    if (!db) return
+    try {
+      const binding = db.get?.<{ binding_id: string }>(
+        `SELECT binding_id FROM project_session_bindings WHERE session_ref = ? ORDER BY bound_at DESC LIMIT 1`,
+        [sessionRef],
+      )
+      const bindingId = binding?.binding_id
+      if (typeof bindingId !== 'string' || bindingId.length === 0) return
+      planDigestJob({ db: db as never, bindingId, sessionRef, now: new Date() })
+    } catch (error) {
+      logger.warn?.(`[psyche] 摘要入队检查失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
   const captureHost = new CaptureHost({
     sink: {
-      capture: async (input: CaptureInput) => (await core()).capture(input),
+      capture: async (input: CaptureInput) => {
+        const result = await (await core()).capture(input)
+        const sessionRef = typeof input.sessionRef === 'string' ? input.sessionRef : ''
+        if (sessionRef.length > 0) maybePlanDigest(sessionRef)
+        return result
+      },
     },
     scope: {
       enabled: cfg.capture?.enabled === true,
@@ -1632,6 +2552,116 @@ export function apply(ctx: Context, config: PsycheConfig): void {
     })
     return preStepInjector
   }
+  /**
+   * Q5-F：在 pre-step 上注入日常原话召回。
+   *
+   * 为什么不在 Composer：那条路上拿不到本轮用户问题（`ProjectionAssembly` 只有
+   * 会话 id，`SessionSurface` 只给事件序号），只能退化成「取最近一轮」，真机上
+   * 把「别人问过同一句话 + 答不知道」顶进了提示。
+   *
+   * 返回 null 表示「这一轮不动 messages」；返回数组表示已替换。
+   * 不论查不查，都先把历史里的旧召回块摘掉——否则上一轮的内容会跟着
+   * agent-loop 的 append 一直留在会话里。
+   */
+  const applyRecallInjection = async (input: {
+    db: { get?: unknown } | null
+    agent: { id?: string; session?: { id?: string } }
+    turn: number
+    query: RecallQuery
+    messages: unknown[]
+    /** 当前会话绑定的联系人；私聊据此把范围收到「这个人说过的话」。 */
+    contactId?: string | null
+  }): Promise<unknown[] | null> => {
+    // 会话标识优先取 `session.id`：`agent.id` 是 agent 实例标识，与回执里
+    // `assembly.agent.session.id` 不是同一个值。此前拿 agent.id 当键去存召回元数据，
+    // 组装回执按 session.id 去取，两边对不上——于是用户会话的回执里读到的是
+    // 另一个会话留下的那一条（第 37 轮真机：receiver 是用户会话，ref 却是我这边）。
+    const sessionId = input.agent.session?.id ?? input.agent.id ?? ''
+    const stripped = stripRecallBlocks(input.messages)
+    const settle = (patch: Partial<{ sourceIds: string[]; sessionRef: string | null; skipped: string | null; status: string | null; queryMode: 'none' | 'continue' | 'specific' | null; messageId: string | null }>): void => {
+      if (sessionId === '') return
+      const prev = recallMetaBySession.get(sessionId)
+      recallMetaBySession.set(sessionId, {
+        sourceIds: prev?.sourceIds ?? [],
+        sessionRef: prev?.sessionRef ?? null,
+        skipped: prev?.skipped ?? null,
+        status: prev?.status ?? null,
+        queryMode: prev?.queryMode ?? null,
+        messageId: prev?.messageId ?? null,
+        at: Date.now(),
+        ...patch,
+      })
+    }
+    const hadBlock = stripped.length !== input.messages.length
+    settle({
+      sourceIds: [],
+      sessionRef: null,
+      skipped: input.query.status === 'ok' ? 'pending' : input.query.status,
+      status: input.query.status,
+      queryMode: input.query.queryMode,
+      messageId: input.query.messageId,
+    })
+    // 没拿到唯一可归属的本轮输入、没有库、没有会话标识：一律不猜。
+    if (
+      input.query.status !== 'ok' ||
+      input.query.query === null ||
+      input.db === null ||
+      sessionId === ''
+    ) {
+      settle({ skipped: input.query.status })
+      return hadBlock ? stripped : null
+    }
+    // 第 37 轮外部评审 P1：总开关此前只挡住原来的 injector，原话召回照样查库。
+    // 关闭态应当连 Source 查询一起停——否则「关掉了记忆」只是关掉了注入。
+    if (cfg.injection?.enabled === false) {
+      settle({ skipped: 'disabled' })
+      return hadBlock ? stripped : null
+    }
+    // 同轮重入保护：宿主可能在同一轮再次调用 pre-step，重复追加会叠块。
+    if (recallTurnSeen.get(sessionId) === input.turn) {
+      return hadBlock ? stripped : null
+    }
+    // 渠道判定：QQ 会话只读自己那侧，委派会话已在 query 阶段短路。
+    const channel = resolveSessionChannel(sessionId, ownerUin(), channelBindingOf(input.agent))
+    if (channel.platforms.length === 0) {
+      settle({ skipped: 'no-channel' })
+      return hadBlock ? stripped : null
+    }
+    const recall = buildConversationRecall({
+      db: input.db as never,
+      personaId: 'main',
+      platform: channel.platforms,
+      sourceChannel: channel.sourceChannel,
+      currentSessionRef: sessionId,
+      query: input.query.query,
+      // 第 37 轮外部评审 P0：QQ 私聊此前只按 platform+channel 过滤，
+      // B 私聊独有的 Source 会出现在 A 的查询里——同 platform 同 channel
+      // 不等于同一联系人。作用域是**联系人**而不是会话：拿会话当范围会和
+      // `currentSessionRef` 互相抵消（唯一允许的会话正好是被排除的那一个），
+      // 本人以前说过的话就一条都召回不到。桌面会话读全部桌面别名。
+      allowedContactId: channel.kind === 'owner-private' ? (input.contactId ?? undefined) : undefined,
+    })
+    recallTurnSeen.set(sessionId, input.turn)
+    const sourceIds = recall.items.flatMap((item) => item.sourceIds)
+    settle({
+      sourceIds,
+      sessionRef: recall.items[0]?.sessionRef ?? null,
+      skipped: recall.skipped,
+      status: input.query.status,
+      queryMode: input.query.queryMode,
+      messageId: input.query.messageId,
+    })
+    if (recall.text === null) return hadBlock ? stripped : null
+    return [
+      ...stripped,
+      buildRecallMessage({
+        text: recall.text,
+        sourceIds,
+        sessionRef: recall.items[0]?.sessionRef ?? null,
+        id: randomUUID(),
+      }),
+    ]
+  }
   ctx.effect(() => {
     // cordis 的监听器签名统一是 (...args: unknown[]) => unknown；事件契约在运行时由
     // dsh-agent-loop 保证：args[0] 是 { messages, turn, step, signal }，args[1] 是 next()。
@@ -1655,27 +2685,66 @@ export function apply(ctx: Context, config: PsycheConfig): void {
         const input = runtimeInputs.readForAgent(agent)
         if(input?.platform==='qq'&&input.groupId&&(groupRuntimeClosed||!qqGroupAllowed(cfg.qq,input)))return decision
         const injector = await ensurePreStepInjector()
-        if (injector === null) {
-          logger.debug?.('[psyche] pre-step: 注入器未启用（injection.enabled=false 或库未就绪）')
-          return decision
-        }
         // dsh-agent 的 agentEvents 会把 `agent` 注入 payload（fused），监听器的
         // this 是 scope carrier 而不是 Agent——身份必须从 payload.agent 取。
-        try {
-          const result = injector.inject(agent, decision.messages as PreStepMessage[], {
-            turn: payload.turn,
-            step: payload.step,
-          })
-          logger.debug?.(
-            `[psyche] pre-step turn=${payload.turn} step=${payload.step} bound=${result.requestId !== null} injected=${result.injected} skipped=${result.skipped ?? '-'} abstained=${result.abstained}`,
-          )
-          return result.injected ? { ...decision, messages: result.messages } : decision
-        } catch (error) {
-          // 记忆链路自身失败不能挡住对话：退回原 decision（fail open）。
-          // 抛出去会让 waterfall 拿到 rejected 值，agent-loop 随后读 undefined.messages 崩掉整轮。
-          logger.warn?.(`[psyche] pre-step 注入失败（已跳过本次注入）：${String(error)}`)
-          return decision
+        let messages = Array.isArray(decision.messages) ? decision.messages : []
+        let changed = false
+        // ① 记忆注入（既有）。注意这里不再因为「没有注入器」就整体早退——
+        //    日常召回走的是另一条链路，早退会把它一起丢掉。
+        if (injector !== null) {
+          try {
+            const result = injector.inject(agent, messages as PreStepMessage[], {
+              turn: payload.turn,
+              step: payload.step,
+            })
+            logger.debug?.(
+              `[psyche] pre-step turn=${payload.turn} step=${payload.step} bound=${result.requestId !== null} injected=${result.injected} skipped=${result.skipped ?? '-'} abstained=${result.abstained}`,
+            )
+            if (result.injected) {
+              messages = result.messages
+              changed = true
+            }
+          } catch (error) {
+            // 记忆链路自身失败不能挡住对话：退回原 decision（fail open）。
+            // 抛出去会让 waterfall 拿到 rejected 值，agent-loop 随后读 undefined.messages 崩掉整轮。
+            logger.warn?.(`[psyche] pre-step 注入失败（已跳过本次注入）：${String(error)}`)
+          }
+        } else {
+          logger.debug?.('[psyche] pre-step: 注入器未启用（injection.enabled=false 或库未就绪）')
         }
+        // ② 日常原话召回（Q5-F）。它与记忆注入互不依赖：Composer 拿不到本轮问题，
+        //    只有 pre-step 同时有 payload.messages（本轮新增输入）和 decision.messages
+        //    （即将提交的完整列表，可以摘旧块）。
+        try {
+          // 第 35 轮曾在 `Agent.meta` 上找委派信号，但 `Agent` 接口没有 `meta`
+          // （runtime-types.d.ts:60 起只有 id/options/session/inbox/status/ctx）。
+          // 第 36 轮从 asar 里查到宿主的真实判据是持久化的会话委派深度：
+          // `SessionHeader.delegationDepth`（顶层缺席＝0，子代理为父深度 + 1），
+          // 另一个信号是 `SessionHeader.origin === 'subagent'`。
+          // header 拿不到才算「判不出」，此时 fail-closed 不查。
+          const delegated = delegationOfAgent(payload.agent ?? this)
+          const query = extractRecallQuery({
+            messages: payload.messages,
+            delegated,
+            // 判得出委派深度（header 在）就算身份已验证；判不出才 fail-closed。
+            receiverVerified: delegated !== null,
+          })
+          const next = await applyRecallInjection({
+            db: runtime.db,
+            agent,
+            turn: payload.turn,
+            query,
+            messages,
+            contactId: channelBindingOf(agent)?.contactId ?? null,
+          })
+          if (next !== null) {
+            messages = next
+            changed = true
+          }
+        } catch (error) {
+          logger.warn?.(`[psyche] pre-step 日常召回注入失败（已跳过）：${String(error)}`)
+        }
+        return changed ? { ...decision, messages } : decision
       })()
     }
     const off = ctx.on('agent/pre-step', listener as (...args: unknown[]) => unknown)
@@ -1689,8 +2758,14 @@ export function apply(ctx: Context, config: PsycheConfig): void {
   // 原则：不收 decision.messages（注入层可能往同一条消息里拼记忆块），
   // 只收宿主已分类的 payload.messages 里 source.kind === 'user' 的那些。
   ctx.effect(() => {
-    if (cfg.mood?.enabled === false) {
-      logger.debug?.('[psyche] mood 已关闭：不收集每轮文本')
+    // 第 37 轮外部评审 P1（04）：这两件事原先是绑在一起的——关掉 mood 就整个
+    // 监听器不注册，关系信号也跟着停。它们是两条独立链路：mood 算全局心情，
+    // 关系信号只认四种明确表达。所以这里按各自开关分别决定跑不跑，只有两条
+    // 都关才不注册监听器。
+    const moodEnabled = cfg.mood?.enabled !== false
+    const relationshipEnabled = cfg.relationship?.enabled !== false
+    if (!moodEnabled && !relationshipEnabled) {
+      logger.debug?.('[psyche] mood 与关系采集都关闭：不收集每轮文本')
       return () => {}
     }
     const listener = function (
@@ -1710,12 +2785,45 @@ export function apply(ctx: Context, config: PsycheConfig): void {
         const sessionId = agent.id ?? agent.session?.id
         if (typeof sessionId !== 'string' || sessionId === '') return decision
         try {
-          moodTurns.record(sessionId, payload.turn, payload.messages)
-          // P5-4：使用 Host 提供的可信 Turn 作为档位驻留门控；重复/回退不推进。
-          moodTurnClock.record(agent, payload.turn)
+          if (moodEnabled) {
+            moodTurns.record(sessionId, payload.turn, payload.messages)
+            // P5-4：使用 Host 提供的可信 Turn 作为档位驻留门控；重复/回退不推进。
+            moodTurnClock.record(agent, payload.turn)
+          }
         } catch (error) {
           // 收集失败不能挡住对话：Mood 是旁路状态。
           logger.warn?.(`[psyche] mood 文本收集失败（已跳过本 step）：${String(error)}`)
+        }
+        // v29.18：关系信号入账。和 mood 不同源——mood 读全部用户文本算 33 维，
+        // 这里只认「明确表达」的四种（感谢/夸赞/道歉/抱怨），而且**必须先有可信
+        // 联系人**：contactId 来自 Adapter 绑定，拿不到就不写，绝不默认记到 Owner
+        // 名下。同一条消息重放用 (contactId, sessionId, turn, messageId) 去重。
+        //
+        // 第 37 轮外部评审 P1（04）：去重键里的 messageId 是必需的。此前拿
+        // `text.length` 当兜底，两条同长但内容不同的消息会撞成同一条，第二次
+        // 被判成 replayed 直接丢掉。拿不到 ID 就跳过，不猜。
+        try {
+          if (relationshipEnabled && runtime.db) {
+            const contactId = resolveAffectContact(agent)
+            if (typeof contactId === 'string' && contactId.length > 0) {
+              for (const raw of payload.messages ?? []) {
+                if (sourceKindOf(raw) !== 'user') continue
+                const text = textOfContent((raw as { content?: unknown }).content)
+                if (text.length === 0) continue
+                const messageId = (raw as { id?: unknown }).id
+                if (typeof messageId !== 'string' || messageId.length === 0) continue
+                ingestAffectSignal(runtime.db, {
+                  contactId,
+                  text,
+                  independenceKey: `${contactId}:${sessionId}:${payload.turn}:${messageId}`,
+                  opId: `affect:${contactId}:${payload.turn}`,
+                })
+              }
+            }
+          }
+        } catch (error) {
+          // 关系数值是旁路状态，写失败不能挡住对话。
+          logger.warn?.(`[psyche] 关系信号入账失败（已跳过本 step）：${String(error)}`)
         }
         return decision
       })()
@@ -2102,6 +3210,69 @@ export function apply(ctx: Context, config: PsycheConfig): void {
   }
   // P7-1：Section、waterfall、Context、Composer 共用这一份判定与快照。
   const personaGate = createPersonaAgentGate((agent) => runtimeInputs.readForAgent(agent))
+  /** 第 29 轮：宿主记在 agent.meta 上的委派信息（origin / delegationDepth）。 */
+  const agentMetaOf = (agent: unknown): unknown => (agent as { meta?: unknown } | null | undefined)?.meta
+  /**
+   * 关系信号要记到谁头上。
+   *
+   * QQ 侧只认 Adapter 绑定——猜错就是记到别人头上，宁可这条信号不写。
+   * 桌面侧没有 Adapter 绑定（`readForAgent` 返回 null），但桌面只有本机主人一个人，
+   * 所以退回 `platform='desktop'` 的那条联系人；连这条都没有就仍然不写。
+   *
+   * 这是 v29.18 上线后 `contact_affect_state` 一直是 0 行的原因：桌面会话拿不到
+   * contactId，所有桌面上的「谢谢你」「做得好」都被静默跳过了。
+   */
+  const resolveAffectContact = (agent: unknown): string | null => {
+    // 归属判定抽在 planAffectContact 里（可测）：委派、非用户消息、有绑定但没
+    // contactId 三种都直接跳过，都不查库。这里只负责「桌面主人是谁」那一步 I/O。
+    const bound = channelBindingOf(agent)
+    const plan = planAffectContact({
+      delegated: delegationOfAgent(agent),
+      hasBinding: bound !== null,
+      boundContactId: bound?.contactId ?? null,
+      messageKind: 'user',
+    })
+    if (plan.kind === 'skip') return null
+    if (plan.kind === 'bound') return plan.contactId
+    const db = runtime.db as { get?: <T>(sql: string, params?: unknown[]) => T | undefined } | null
+    if (db === null) return null
+    try {
+      const row = db.get?.<{ contact_id: string }>(
+        `SELECT contact_id FROM contacts WHERE platform = 'desktop' ORDER BY created_at LIMIT 1`,
+      )
+      return typeof row?.contact_id === 'string' && row.contact_id.length > 0 ? row.contact_id : null
+    } catch {
+      return null
+    }
+  }
+  /**
+   * 第 29 轮：QQ 侧的可信身份来自 RuntimeInput 绑定（Adapter 声明、Core 解析），
+   * 不从会话标识里猜。桌面会话本来就没有 Adapter 绑定，`readForAgent` 返回 null，
+   * 由 `resolveSessionChannel` 退回形状判定。
+   */
+  const channelBindingOf = (agent: unknown): ChannelBinding | null => {
+    const bound = runtimeInputs.readForAgent((agent ?? null) as never)
+    if (bound === null) return null
+    let stableUserId: string | null = null
+    const db = runtime.db as { get?: <T>(sql: string, params?: unknown[]) => T | undefined } | null
+    if (db !== null && bound.contactId !== null) {
+      try {
+        const row = db.get?.<{ stable_user_id: string }>(
+          'SELECT stable_user_id FROM contacts WHERE contact_id = ?',
+          [bound.contactId],
+        )
+        stableUserId = row?.stable_user_id ?? null
+      } catch {
+        stableUserId = null
+      }
+    }
+    return {
+      platform: bound.platform,
+      contactId: bound.contactId,
+      groupId: bound.groupId ?? null,
+      stableUserId,
+    }
+  }
   const personaDominance = createPersonaDominance({
     enabled: () => cfg.persona?.enabled !== false,
     dominance: () => cfg.persona?.dominance === true,
@@ -2197,6 +3368,8 @@ export function apply(ctx: Context, config: PsycheConfig): void {
         syncPersonaContext()
       }
       let projection: ProjectionController | null = null
+      // Q5 渠道判定：回答「谁在问」时要知道 Owner 是谁（`ownerUin` 已提到外层，
+      // 因为 pre-step 的日常召回也要用它）。
       if (promptApi && cfg.projection?.enabled !== false) {
         const relationshipProvider = createRelationshipContextProvider({
           enabled: () => cfg.relationship?.enabled !== false,
@@ -2235,11 +3408,49 @@ export function apply(ctx: Context, config: PsycheConfig): void {
               maxTokens: Math.max(0, PROJECTION_MAX_TOKENS - tokens),
             }
           },
+          // Q5-E：只读组装回执。采样点在 ProjectionController 里——
+          // 只有那里同时知道「这块有没有被保留」和「最终占了多少字符」。
+          receipts: assemblyReceipts,
+          receiptMeta: (assembly) => {
+            const sessionId = assembly?.agent?.session?.id ?? null
+            // 委派信号改从会话 header 读（第 36 轮）：宿主把深度持久化在
+            // `SessionHeader.delegationDepth`，`origin` 作否定信号兜底。
+            const delegatedFlag = delegationOfAgent(assembly?.agent)
+            const header = (assembly?.agent?.session as { header?: { delegationDepth?: unknown; origin?: unknown } } | undefined)?.header
+            const delegated = delegatedFlag === true
+            const delegatedBy: 'session.header.depth' | 'session.header.origin' | 'none' =
+              typeof header?.delegationDepth === 'number' && header.delegationDepth > 0
+                ? 'session.header.depth'
+                : header?.origin === 'subagent'
+                  ? 'session.header.origin'
+                  : 'none'
+            let channel: 'desktop' | 'owner-private' | 'other' | 'unknown' = 'unknown'
+            if (sessionId !== null && sessionId.length > 0) {
+              try {
+                channel = resolveSessionChannel(sessionId, ownerUin(), channelBindingOf(assembly?.agent)).kind
+              } catch {
+                channel = 'unknown'
+              }
+            }
+            // 只有「这一轮确实调过」才把明细挂上去，否则看不出是没调还是调了没命中。
+            const recallMeta = sessionId !== null ? recallMetaBySession.get(sessionId) : undefined
+            const recallCalled = recallMeta !== undefined
+            const briefCalled = sessionId !== null && lastBriefMeta.sessionId === sessionId
+            return {
+              channel,
+              delegated,
+              delegatedBy,
+              turnId: null,
+              recallSourceIds: recallCalled ? recallMeta.sourceIds : [],
+              recallSessionRef: recallCalled ? recallMeta.sessionRef : null,
+              recallSkipped: recallCalled ? recallMeta.skipped : 'not-called',
+              projectCheckpointId: briefCalled ? lastBriefMeta.checkpointId : null,
+              projectRevision: briefCalled ? lastBriefMeta.revision : null,
+            }
+          },
           sources: {
             // P5-R：隐私/Scope 纪律是必需层，不随普通 prompt.section 偏好关闭。
-            discipline: () => PROMPT_SECTION,
-            persona: (assembly) => {
-              if (cfg.persona?.enabled === false) return ''
+            discipline: () => PROMPT_SECTION,            persona: (assembly) => {              if (cfg.persona?.enabled === false) return ''
               // P7-1：dominance 接管时 Composer 让位，避免与 Section/waterfall 重复。
               if (personaDominance(assembly as never)) return ''
               if (!personaGate(assembly?.agent)) return ''
@@ -2288,6 +3499,40 @@ export function apply(ctx: Context, config: PsycheConfig): void {
               return renderMoodProjection(behavior.band, tone === '平稳' ? '' : tone)
             },
             relationship: (assembly) => relationshipProvider.text(assembly ?? {}),
+            // G1-B：同一项目的只读 Brief。零模型调用、不写库；
+            // 没绑定、没存过 Checkpoint、正文为空都返回空串（整块省略）。
+            projectBrief: (assembly) => {
+              const db = runtime.db
+              if (db === null) return ''
+              const sessionId = assembly?.agent?.session?.id ?? null
+              if (sessionId === null || sessionId.length === 0) return ''
+              try {
+                // 第 29 轮：子代理会话不读主人的项目进度。第 36 轮把判据从
+                // `Agent.meta`（不存在）换成持久化的会话委派深度；判不出时按
+                // fail-closed 也不给——项目进度同属主人私有上下文。
+                if (delegationOfAgent(assembly?.agent) !== false) return ''
+                // 渠道判定：项目 Brief 只在桌面侧装配。QQ 侧还没有项目绑定的
+                // 映射关系，先明确不给，避免 QQ 会话读到桌面绑定的项目。
+                const channel = resolveSessionChannel(sessionId, ownerUin(), channelBindingOf(assembly?.agent))
+                const platform = briefPlatformFor(channel)
+                if (platform === null) return ''
+                const brief = buildProjectBrief({
+                  db: db as unknown as Parameters<typeof buildProjectBrief>[0]['db'],
+                  sessionId,
+                  personaId: 'main',
+                  platform,
+                })
+                lastBriefMeta = { checkpointId: brief.checkpointId, revision: brief.revision, sessionId }
+                return brief.text ?? ''
+              } catch {
+                return ''
+              }
+            },
+            // Q5-F：日常原话召回**已从这里撤下**，改在 `agent/pre-step` 注入。
+            // 原因：这条路上拿不到本轮用户问题（`ProjectionAssembly` 只有会话 id，
+            // `SessionSurface` 只给事件序号），只能退化成「取最近一轮」，真机上把
+            // 「别人问过同一句话 + 答不知道」顶进了提示。Composer 与 pre-step
+            // 必须同一批切换，否则一轮会注入两次。
             // P6-1：默认关；只有可信绑定 Agent + 显式开启时才读一行 internal 意愿。
             // 表不存在（P6-2 迁移前）时 readLatestIntentionLine 返回 null，整块省略。
             intention: (assembly) => {
@@ -2505,11 +3750,26 @@ export function apply(ctx: Context, config: PsycheConfig): void {
       readJsonBody,
     })
 
+    // G1-A 手动交接（预览 / 保存 / 读取）。模型调用为零：预览只读库、保存只写 v32 七张表。
+    const projectHandoffRoutes = registerProjectHandoffRoutes({
+      ready,
+      db: () => runtime.db,
+      unavailable: () =>
+        runtime.bootError
+          ? `记忆引擎没起来：${runtime.bootError instanceof Error ? runtime.bootError.message : String(runtime.bootError)}`
+          : null,
+      logger,
+      send,
+      sendJson,
+      readJsonBody,
+    })
+
     const routes: readonly HttpRoute[] = [
       ...initRoutes,
       ...grantRoutes,
       ...injectionRoutes,
       ...rememberRoutes,
+      ...projectHandoffRoutes,
       {
         // 面板图表用的 ECharts 离线包：直接从插件包内 assets 读，不依赖 CDN 与网络。
         // 返回 JS 而不是 JSON，所以不走 send()；文件缺失时 404，面板退回纯数字卡片。
@@ -2592,15 +3852,93 @@ export function apply(ctx: Context, config: PsycheConfig): void {
             response.setHeader?.('Cache-Control', 'no-store')
             sendJson(
               response,
-              buildQqAdminPayload({
-                enabled: qqBridge !== null,
-                snapshot: qqBridge?.adminSnapshot() ?? null,
-                logs: qqLogs.snapshot(),
-              }),
+              {
+                ...buildQqAdminPayload({
+                  enabled: qqBridge !== null,
+                  // 桥接没建起来时要能分清「没开」和「开不起来」。
+                  startError: qqStartError,
+                  failedEpoch: bridgeFailedEpoch,
+                  snapshot: qqBridge?.adminSnapshot() ?? null,
+                  logs: qqLogs.snapshot(),
+                }),
+                // 第 12 轮评审：QQ 页要有一块只读「待投递提醒」，让「已延后」看得见。
+                // 只读视图现读现算，展示用的预计时间优先取队列行的 retry_at。
+                pendingReminders: buildPendingReminders({
+                  db: runtime.db as never,
+                  personaId: 'main',
+                  limit: 8,
+                }),
+              },
             )
           } catch (error) {
             logger.warn?.(`[psyche] 读 QQ 管理页失败：${errorText(error)}`)
             send(response, 500, httpErrorBody(error))
+          }
+        },
+      },
+      {
+        // 工作区卡（第一批 · 五态）：宿主没有 `workspace/list`，所以这里用
+        // `workspace/follow` 的 baseline 现读一次再判状态；读不到就如实标「未核实」。
+        // GET 只读；POST 只做一件事——改显示名（目录与配置来源只读）。
+        kind: 'exact',
+        path: '/api/psyche/qq/workspace',
+        handler: async (request, response) => {
+          await ready
+          const method = (request.method ?? 'GET').toUpperCase()
+          response.setHeader?.('Cache-Control', 'no-store')
+          // GPT 第 1 轮第 5 条：写动作不能只靠前端隐藏入口 + 输入校验。
+          // 可信身份由宿主提供——`/api/psyche/*` 要过宿主的 browser-session 鉴权，
+          // 插件不重复造身份体系；这里再补一道来源校验，挡掉别的站点页面直接 POST。
+          if (
+            method === 'POST'
+            && !sameOriginWrite(
+              request as unknown as {
+                headers?: Record<string, string | string[] | undefined>
+                protocol?: string
+                socket?: { encrypted?: boolean }
+              },
+            )
+          ) {
+            send(response, 403, { ok: false, error: '改工作区名只接受本机同源请求' })
+            return
+          }
+          if (method === 'GET') {
+            try {
+              sendJson(response, await qqWorkspaceCard())
+            } catch (error) {
+              logger.warn?.(`[psyche][qq] 读工作区卡失败：${errorText(error)}`)
+              send(response, 500, { ok: false, error: '读工作区状态失败' })
+            }
+            return
+          }
+          if (method !== 'POST') {
+            send(response, 405, { ok: false, error: '只接受 GET / POST' })
+            return
+          }
+          let body: Record<string, unknown>
+          try {
+            body = await readJsonBody(request as unknown as HttpRequest)
+          } catch {
+            send(response, 400, { ok: false, error: '请求体不是合法 JSON' })
+            return
+          }
+          const raw = body.title
+          if (typeof raw !== 'string') {
+            send(response, 400, { ok: false, error: '缺少 title' })
+            return
+          }
+          const title = raw.trim()
+          if (title === '' || title.length > 40 || /[\r\n]/.test(title)) {
+            send(response, 400, { ok: false, error: '标题留空、超过 40 字或含换行都不行' })
+            return
+          }
+          try {
+            sendJson(response, await renameQqWorkspace(title))
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            logger.warn?.(`[psyche][qq] 改工作区名失败：${message}`)
+            const status = message.startsWith('宿主里还没有') ? 409 : 500
+            send(response, status, { ok: false, error: message })
           }
         },
       },
@@ -3149,3 +4487,4 @@ export function apply(ctx: Context, config: PsycheConfig): void {
 }
 
 export default { name, inject, Config, apply }
+

@@ -86,7 +86,7 @@ export function textOfContent(content: unknown): string {
 
 export interface MoodMessageLike {
   id?: string
-  source?: { kind?: string; psyche?: unknown; lingban?: unknown } | null
+  source?: { kind?: string; psyche?: unknown } | null
   content?: unknown
 }
 
@@ -101,13 +101,13 @@ export interface MoodUserEntry {
  * 与 CaptureHost.isInjectionMessage 保持同一判定：正文里的 `<memory-context>` 不可信。
  */
 function isInjectionMessage(record: MoodMessageLike): boolean {
-  const marker = record.source?.psyche ?? record.source?.lingban
+  const marker = record.source?.psyche
   if (marker !== null && typeof marker === 'object') {
     const injection = (marker as { injection?: unknown }).injection
     if (injection === 'memory-context') return true
   }
   const id = typeof record.id === 'string' ? record.id : ''
-  return id.startsWith('msg_psyche_') || id.startsWith('msg_lingban_')
+  return id.startsWith('msg_psyche_')
 }
 
 /**

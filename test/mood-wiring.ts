@@ -72,13 +72,6 @@ function injected(text: string, id?: string): unknown {
 }
 check(buffer.record('s1', 4, [injected('你记得我怕冷吗')]) === false, 'psyche 注入不收集（source 标记）')
 check(buffer.record('s1', 5, [user('旧注入', 'msg_psyche_abc')]) === false, 'psyche 注入不收集（id 前缀）')
-const legacyInjected = {
-  id: 'legacy-marker',
-  source: { kind: 'user', lingban: { injection: 'memory-context' } },
-  content: [{ type: 'text', text: '旧版注入' }],
-}
-check(buffer.record('s1', 7, [legacyInjected]) === false, '旧 Lingban 来源标记不收集')
-check(buffer.record('s1', 8, [user('旧版注入', 'msg_lingban_abc')]) === false, '旧 msg_lingban_ 前缀不收集')
 check(buffer.record('s1', 6, [injected('注入'), user('真话', 'm6')]) === true, '混入注入时只收真实用户消息')
 check(buffer.take('s1', 6)?.texts.join('|') === '真话', '注入文本被丢弃')
 check(userTextsOf([injected('我今天好开心')]).length === 0, '注入即使命中关键词也不产生文本')

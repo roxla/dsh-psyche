@@ -70,11 +70,11 @@ function choose(intentionId: string, choice: ChoiceDecision['choice'] = 'interna
   return { intentionId, choice, reason: choice === 'abandon' ? 'missing-evidence' : choice === 'defer' ? 'lower-priority' : 'selected' }
 }
 
-await test('Schema v31 建出两张意愿表', async () => {
+await test('Schema v36 建出两张意愿表', async () => {
   const f = await setup()
   try {
-    assert.equal(SCHEMA_VERSION, 31)
-    assert.equal(EXPECTED_TABLE_COUNT, 70)
+    assert.equal(SCHEMA_VERSION, 42)
+    assert.equal(EXPECTED_TABLE_COUNT, 81)
     const names = f.db
       .all<{ name: string }>(`SELECT name FROM sqlite_master WHERE type='table' AND name IN ('intentions','intention_events')`)
       .map((row) => row.name)

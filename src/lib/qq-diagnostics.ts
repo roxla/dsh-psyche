@@ -52,7 +52,12 @@ const MEDIA_TYPES: readonly QqDiagnosticMediaType[] = [
 const ERROR_CODES = new Set([
   'not-connected', 'timeout', 'bridge-stopped', 'empty-text', 'inactive-before-send',
   'send-exception', 'send-timeout', 'transport_offline_before_send', 'rate_limited',
-  'unclassified_retryable', 'other',
+  'unclassified_retryable',
+  // 放行决策点引入的原因码。之前它们全被折叠成 other，面板上看不出「是被撤销了、
+  // 撞了安静时段、配置坏了，还是这条回复根本找不到归属」——审计想要分辨的正是这些。
+  'access-superseded', 'access-revoked', 'access-pending',
+  'outside-reply-window', 'unresolved-inbound', 'config-corrupt',
+  'other',
 ])
 
 export interface QqDiagnosticEvent {

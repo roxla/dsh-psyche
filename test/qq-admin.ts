@@ -108,6 +108,7 @@ const flush = async () => {
     allowFromValid: true,
     allowFromOwner: '10001',
     allowFromExtra: ['10002', '10003'],
+    allowFromGroups: ['30001'],
     counts: {
       received: 9,
       delivered: 4,
@@ -130,6 +131,7 @@ const flush = async () => {
   eq('E2 账号脱敏', payload.account.uinMasked, '100****67')
   eq('E3 owner 脱敏', payload.allowFrom.ownerMasked, '*****')
   eq('E4 extra 脱敏', payload.allowFrom.extraMasked, ['*****', '*****'])
+  eq('E4b 群白名单脱敏', [payload.allowFrom.groupsCount, payload.allowFrom.groupsMasked], [1, ['*****']])
   ok('E5 昵称保留', payload.account.nickname === '小鲸鱼')
   eq('E6 计数原样', payload.counts.rejected, 3)
   eq('E7 日志透传', payload.logs.length, 1)
@@ -178,7 +180,7 @@ function makeBridge() {
         return undefined
       },
       async resume() {
-        throw new Error('no session')
+        throw new Error('session not found: qq-private-10001')
       },
       async create() {
         return { agent: { followup() { calls.followup += 1 } } }
@@ -200,7 +202,7 @@ function makeBridge() {
       unknownPolicy: 'reject',
       sendTimeoutMs: 2_000,
     },
-    { host, adapter, logger, webSocket: FakeSocket, isSessionBound: () => true },
+    { host, adapter, logger, webSocket: FakeSocket, allowLegacyAgentCreate: true, isSessionBound: () => true },
   )
   bridge.start()
   return { bridge, socket: FakeSocket.last }

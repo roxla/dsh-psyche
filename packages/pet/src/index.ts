@@ -7,7 +7,7 @@
  */
 import type { PsycheCore } from 'dsh-psyche-contract'
 
-export const name = 'dsh-psyche-pet'
+export const name = 'roxla-dsh-psyche-pet'
 
 export interface PetOptions {
   enabled?: boolean

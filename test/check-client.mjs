@@ -40,6 +40,7 @@ const marks = {
   qqCounts: text.includes('未授权私聊'),
   qqLogs: text.includes('运行日志'),
   qqReadonly: !text.includes('send_private_msg') && !text.includes('启动 SnowLuma'),
+  pendingReminders: text.includes('待投递提醒'),
 }
 console.log(JSON.stringify({ file, bytes: Buffer.byteLength(text), bad, hasEsm, loads, marks }, null, 2))
 if (bad || hasEsm || !loads || Object.values(marks).some((ok) => !ok)) process.exitCode = 1

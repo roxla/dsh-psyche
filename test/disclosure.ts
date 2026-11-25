@@ -199,7 +199,7 @@ ok('rebuild 后 integrity 通过', verified.integrityOk)
 // ── 7. 新库 schema ───────────────────────────────────────────────────
 const columns = db.all(`PRAGMA table_info(artifact_revisions)`).map((row) => row.name)
 ok('artifact_revisions 有 disclosure 列', columns.includes('disclosure'))
-eq('user_version 是 31', db.get(`PRAGMA user_version`).user_version, 31)
+eq('user_version 是 42', db.get(`PRAGMA user_version`).user_version, 42)
 
 console.log(`\n[P2-FTS5 E3] ${passed} 通过 ${failed} 失败`)
 db.close()

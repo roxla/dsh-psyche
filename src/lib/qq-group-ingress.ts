@@ -41,6 +41,36 @@ export function groupCapturePolicies(value: unknown): ReadonlyMap<string, GroupC
   return result
 }
 
+/**
+ * 第 50 轮外部评审 Q1（选 a）：这个群该按什么策略采集。
+ *
+ * - `config.groups` 里已配好的精细 `RoomPolicy` 优先，两套不叠加；
+ * - 只在覆盖层白名单里、没配精细策略的群，用 `all_visible_messages`——
+ *   这个字符串只决定「采集哪些消息」，**不产生 reply 概念**，
+ *   所以被白名单放进来只意味着能读，不意味着会回复（群回复另有开关，默认关）；
+ * - 都不在 → `null`，调用方应当拒绝这条消息且不建会话、不建 Source。
+ */
+export function resolveGroupCaptureMode(
+  policies: ReadonlyMap<string, GroupCaptureMode | RoomPolicy>,
+  groupId: string,
+  allowedGroups: readonly string[],
+  /** 覆盖层是否显式写了 `groups`（哪怕是空数组）。 */
+  explicitlyListed = false,
+): GroupCaptureMode | RoomPolicy | null {
+  if (groupId === '') return null
+
+  // 第 51 轮外部评审：显式名单可以**撤销**采集。
+  //
+  // 宿主配了群 G、Owner 在管理页把 groups 存成 []，之后 G 又来一条消息——
+  // 这时必须是新增 Source 0、建会话 0、回复 0。如果先取精细策略，
+  // G 仍会被采集，撤销就是假的。所以名单检查必须在选策略之前。
+  if (explicitlyListed && !allowedGroups.includes(groupId)) return null
+
+  const existing = policies.get(groupId)
+  if (existing !== undefined) return existing
+  return allowedGroups.includes(groupId) ? 'all_visible_messages' : null
+}
+
 export function groupMessageForCapture(event: unknown, policies: ReadonlyMap<string, GroupCaptureMode | RoomPolicy>, text: string, at: string): GroupMessageInput | null {
   const value = object(event)
   if (!value || value.post_type !== 'message' || value.message_type !== 'group' || value.sub_type !== 'normal') return null

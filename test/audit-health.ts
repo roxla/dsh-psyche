@@ -35,7 +35,7 @@ check('正常库 status=ok', healthy.status === 'ok', JSON.stringify(healthy.iss
 check('正常库 schemaVersion 是当前版本', healthy.schemaVersion === SCHEMA_VERSION)
 check('正常库 tableCount 是当前49', healthy.facts.tableCount === EXPECTED_TABLE_COUNT)
 // v23 新增群调度证明触发器；v24 新增离线回复队列绑定/终态两条触发器。
-check('正常库 triggerCount 是 40', healthy.facts.triggerCount === 40)
+check('正常库 triggerCount 是 44', healthy.facts.triggerCount === 44)
 check('正常库零失败', healthy.summary.failed === 0)
 check('正常库 readOnly 为 true', healthy.readOnly === true)
 check('正常库 queryOnly 为 true', healthy.facts.queryOnly === true)

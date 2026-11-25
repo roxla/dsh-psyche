@@ -3,13 +3,29 @@
   "compilerOptions": {
     "lib": ["ES2023", "DOM"],
     "types": [],
-    "module": "ES2022",
-    "moduleResolution": "bundler",
+    "module": "none",
+    "moduleResolution": "classic",
+    "verbatimModuleSyntax": false,
     "removeComments": true,
-    "rootDir": "src/client",
-    "outDir": "dist/client",
+    "outFile": "dist/client/index.js",
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["src/client/**/*.ts"]
+  "files": [
+    "src/client/preamble.ts",
+    "src/client/types.ts",
+    "src/client/shared.ts",
+    "src/client/shell.ts",
+    "src/client/tabs/usage.ts",
+    "src/client/tabs/overview.ts",
+    "src/client/tabs/ops.ts",
+    "src/client/tabs/mood.ts",
+    "src/client/tabs/settings.ts",
+    "src/client/tabs/memory.ts",
+    "src/client/tabs/qq.ts",
+    "src/client/tabs/sea.ts",
+    "src/client/index.ts"
+  ],
+  "include": [],
+  "exclude": []
 }

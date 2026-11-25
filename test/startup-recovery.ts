@@ -1,4 +1,4 @@
-// E6-A 启动与升级恢复：失败要明确、不降级、不静默重建。
+﻿// E6-A 启动与升级恢复：失败要明确、不降级、不静默重建。
 //
 // 覆盖：
 // 1. 驱动名不可用 → E_DB（不切内存库、不假装成功）；
@@ -111,7 +111,7 @@ console.log('\n[5] 重复打开：不重复迁移、不重复建表')
       `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'fts_index_%'`,
     )
     .map((row) => row.name)
-  eq('表数仍是当前 70', tables.filter((name) => name !== 'fts_index').length, 70)
+  eq('表数仍是当前 81', tables.filter((name) => name !== 'fts_index').length, 81)
   second.db.close()
 }
 

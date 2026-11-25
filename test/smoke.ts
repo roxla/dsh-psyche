@@ -61,13 +61,13 @@ console.log(`  驱动：${opened.driver}；自检：${opened.selfCheck.ok ? '通
 ok('能力自检五项全过', opened.selfCheck.ok, selfFailures)
 eq('自检五项都在', opened.selfCheck.items.length, 5)
 ok('驱动是 node:sqlite', opened.driver === 'node:sqlite', opened.driver)
-eq('user_version=31', db.userVersion(), 31)
+eq('user_version=42', db.userVersion(), 42)
 
 const tables = db
   .all(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'fts_index_%'`)
   .map((row) => row.name)
 console.log(`  表：${tables.length} 张${tables.includes('fts_index') ? '（含 fts_index）' : ''}`)
-ok('v31 七十张业务表齐全（含意愿持久化）', tables.filter((t) => t !== 'fts_index').length === 70, tables.filter((t) => t !== 'fts_index').length)
+ok('v37 八十一张业务表齐全（含授权代次）', tables.filter((t) => t !== 'fts_index').length === 81, tables.filter((t) => t !== 'fts_index').length)
 ok('FTS5 壳表已建', tables.includes('fts_index'))
 eq('journal_mode = wal', String(db.pragma('journal_mode')).toLowerCase(), 'wal')
 eq('foreign_keys = 1', Number(db.pragma('foreign_keys')), 1)
@@ -377,7 +377,7 @@ ok('fetch 遵守字符预算', fetched.used <= fetched.budget, { used: fetched.u
 
 const state = await core.getState()
 ok('state 报的规模与库里一致', state.counts.events === db.all(`SELECT count(*) AS n FROM events`)[0].n, state.counts)
-ok('state 带存储健康信息', state.storage.driver === 'node:sqlite' && state.storage.tables === 70, state.storage.tables)
+ok('state 带存储健康信息', state.storage.driver === 'node:sqlite' && state.storage.tables === 81, state.storage.tables)
 
 console.log('\n[11] 只追加触发器')
 try {
@@ -612,12 +612,12 @@ await expectError(
 console.log('\n[16] 工具清单（回归：新加的工具必须真的出现在 buildTools 的返回里）')
 const toolList = buildTools(core as unknown as Parameters<typeof buildTools>[0]) as { name: string }[]
 const toolNames = toolList.map((tool) => tool.name)
-eq('工具共 12 个', toolNames.length, 12)
-ok('工具名互不重复', new Set(toolNames).size === 12, toolNames)
+eq('工具共 18 个', toolNames.length, 18)
+ok('工具名互不重复', new Set(toolNames).size === 18, toolNames)
 ok('包含新增的 psyche_context', toolNames.includes('psyche_context'), toolNames)
 ok(
-  '十二个工具一个不少',
-  ['remember', 'clash', 'revise', 'review', 'forget', 'propose', 'stances', 'state', 'relationship', 'recall', 'fetch'].every(
+  '十七个工具一个不少',
+  ['remember', 'clash', 'revise', 'review', 'forget', 'propose', 'stances', 'state', 'relationship', 'recall', 'fetch', 'create_reminder', 'list_reminders', 'resolve_delivery', 'cancel_reminder', 'growth_candidates', 'growth_decide'].every(
     (suffix) => toolNames.includes(`psyche_${suffix}`),
   ),
   toolNames,
@@ -667,8 +667,8 @@ const v1TriggerNames = v1
   .all(`SELECT name FROM sqlite_master WHERE type = 'trigger'`)
   .map((row) => String(row.name))
 const appliedV2 = migrate(v1)
-eq('v1→v31 应用三十步（v2 至 v31）', appliedV2.length, 30)
-eq('迁移后 user_version=31', v1.userVersion(), 31)
+eq('v1→v42 应用四十一步（v2 至 v42）', appliedV2.length, 41)
+eq('迁移后 user_version=42', v1.userVersion(), 42)
 eq('v1 时代的提案还在', String(scalar(v1, `SELECT partition FROM proposals WHERE proposal_id = 'prop_v1_keep'`)), 'life')
 eq('外键仍然是开着的', String(v1.pragma('foreign_keys')), '1')
 ok(
@@ -729,13 +729,13 @@ eq(
   Number(scalar<number>(v1b, `SELECT COUNT(*) FROM pragma_table_info('phase_evidence') WHERE name = 'milestone_id'`) ?? 0),
   0,
 )
-eq('重跑迁移能补上（v2 至 v31 共三十步）', migrate(v1b).length, 30)
+eq('重跑迁移能补上（v2 至 v42 共四十一步）', migrate(v1b).length, 41)
 eq(
   '重跑后列有了',
   Number(scalar<number>(v1b, `SELECT COUNT(*) FROM pragma_table_info('phase_evidence') WHERE name = 'milestone_id'`) ?? 0),
   1,
 )
-eq('重跑后版本是 31', v1b.userVersion(), 31)
+eq('重跑后版本是 42', v1b.userVersion(), 42)
 v1b.close()
 v1.close()
 

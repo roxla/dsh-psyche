@@ -50,7 +50,7 @@ function harness() {
     host: {
       agents: {
         get: (id) => agents.get(id),
-        resume: async () => { throw new Error('new session') },
+        resume: async () => { throw new Error('session not found: qq-private-10001') },
         create: async () => creating.promise,
       },
       on: (_name: string, callback: (session: unknown, event: unknown) => void) => {
@@ -61,6 +61,7 @@ function harness() {
     adapter: { announce: () => {}, forget: () => {}, size: () => 0 },
     logger: { info() {}, error() {}, warn(text) { warnings.push(text) } },
     webSocket: Socket,
+    allowLegacyAgentCreate: true,
     isSessionBound: () => true,
   })
   const agent = { followup: (message: unknown) => { calls.followup.push(message) } }
@@ -88,6 +89,9 @@ console.log('[P4-B-2] QQ outbound quote and multiline')
     { type: 'text', data: { text: '第一行\n\n第二行' } },
   ])
   eq('A2 CRLF 规范化为 LF', normalizeOutgoingText('a\r\nb\rc'), 'a\nb\nc')
+  eq('A2a leading blank lines including CRLF', normalizeOutgoingText('\r\n \t\r\n  code\n\nnext\n'), '  code\n\nnext\n')
+  eq('A2b first-line indentation', normalizeOutgoingText('    code'), '    code')
+  eq('A2c ideographic space on blank line', normalizeOutgoingText('\u3000\n回答'), '回答')
   eq('A3 CQ 文本不产生额外段', buildOutgoingMessage('看这个 [CQ:image,file=x] 好'), [
     { type: 'text', data: { text: '看这个 [CQ:image,file=x] 好' } },
   ])
@@ -134,7 +138,7 @@ console.log('[P4-B-2] QQ outbound quote and multiline')
   eq('C0 入站已投递', h.calls.followup.length, 1)
 
   const before = socket.sent.length
-  const r1 = await sendAndAck(h.bridge, socket, { kind: 'private', userId: '10001' }, '第一行\n第二行', first.message_id)
+  const r1 = await sendAndAck(h.bridge, socket, { kind: 'private', userId: '10001' }, '\n\n第一行\n第二行', first.message_id)
   eq('C1 可引用本次入站消息', r1.quote, 'applied')
   eq('C2 多行只发一条', socket.sent.length - before, 1)
   const action = socket.sent.at(-1)
@@ -184,9 +188,15 @@ console.log('[P4-B-2] QQ outbound quote and multiline')
   h.creating.resolve({ agent: h.agent })
   await flush()
   const before = socket.sent.length
-  for (const listener of h.listeners) {
-    listener({ id: 'qq-private-10001' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '收到' }] } } })
-  }
+  // P0-A：出站只认「这一轮的准入快照」，所以要按宿主真实顺序把一轮跑全：
+  // turn/start 开窗 → 带平台消息 id 的 user/message 绑定 → assistant/message 带 turn。
+  const emitHost = (event: unknown) => { for (const listener of h.listeners) listener({ id: 'qq-private-10001' }, event) }
+  emitHost({ type: 'turn/start', data: { turn: 1 } })
+  emitHost({
+    type: 'user/message',
+    data: { id: `msg_qq_${inbound.message_id}`, role: 'user', content: [{ type: 'text', text: '在吗' }], source: { kind: 'user' } },
+  })
+  emitHost({ type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '收到' }] } } })
   await new Promise((resolve) => setTimeout(resolve, 1))
   socket.message({ status: 'ok', retcode: 0, data: { message_id: 'ack-auto' } })
   await flush()

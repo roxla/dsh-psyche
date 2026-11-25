@@ -51,9 +51,9 @@ const db = opened.db
 const v1 = db.userVersion()
 const applied = migrate(db, log)
 const v2 = db.userVersion()
-ok('第一次启动已迁到最新 schema（v31）', v1 === 31, v1)
+ok('第一次启动已迁到最新 schema（v42）', v1 === 42, v1)
 ok('再跑一次不再应用任何迁移', applied.length === 0, applied)
-ok('user_version 不变', v2 === 31, v2)
+ok('user_version 不变', v2 === 42, v2)
 const tablesOnce = db.all(`SELECT count(*) AS n FROM sqlite_master WHERE type = 'table'`)[0].n
 const reopened = await openDatabase({ file, driverPreference: 'auto', logger: log })
 ok('第二次打开不会重复建表', reopened.db.all(`SELECT count(*) AS n FROM sqlite_master WHERE type = 'table'`)[0].n === tablesOnce, {

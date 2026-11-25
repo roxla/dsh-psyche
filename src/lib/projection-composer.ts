@@ -17,6 +17,8 @@ export const PROJECTION_MAX_CHARS = 8_000
 export type ProjectionBlockName =
   | 'memoryDiscipline'
   | 'persona'
+  | 'projectBrief'
+  | 'conversationRecall'
   | 'growth'
   | 'mood'
   | 'relationship'
@@ -30,6 +32,18 @@ export interface ProjectionBlock {
 export interface ProjectionInput {
   memoryDiscipline: string
   persona: ProjectionBlock
+  /**
+   * G1-B：同一项目的只读 Brief（当前目标 / 已完成 / 阻塞 / 下一步）。
+   * 它回答「这一轮要接着做什么」，比成长、情绪更贴近当轮任务，
+   * 所以在可选层里最后才丢；但排在人格之后，不挤占必需层。
+   */
+  projectBrief?: ProjectionBlock
+  /**
+   * Q5-A：最近的实际对话片段（原话召回）。
+   * 它回答「我们上次聊到哪」，与 projectBrief 的「这一轮接着做什么」正交互补；
+   * 排在 Brief 之后、成长之前——聊过的内容比长期画像更该进当轮上下文。
+   */
+  conversationRecall?: ProjectionBlock
   growth?: ProjectionBlock
   mood?: ProjectionBlock
   relationship?: ProjectionBlock
@@ -53,6 +67,8 @@ export interface ProjectionResult {
 }
 
 const OPTIONAL_KEEP_ORDER: Array<Exclude<ProjectionBlockName, 'memoryDiscipline' | 'persona'>> = [
+  'projectBrief',
+  'conversationRecall',
   'growth',
   'mood',
   'relationship',
@@ -64,11 +80,15 @@ const OPTIONAL_DROP_ORDER: Array<Exclude<ProjectionBlockName, 'memoryDiscipline'
   'relationship',
   'mood',
   'growth',
+  'conversationRecall',
+  'projectBrief',
 ]
 
 const SERIALIZE_ORDER: ProjectionBlockName[] = [
   'memoryDiscipline',
   'persona',
+  'projectBrief',
+  'conversationRecall',
   'growth',
   'mood',
   'relationship',
@@ -122,6 +142,8 @@ export function composeProjections(
   const byName: Record<ProjectionBlockName, ProjectionBlock | undefined> = {
     memoryDiscipline: { text: discipline },
     persona: keepPersona ? { text: persona } : undefined,
+    projectBrief: input.projectBrief,
+    conversationRecall: input.conversationRecall,
     growth: input.growth,
     mood: input.mood,
     relationship: input.relationship,

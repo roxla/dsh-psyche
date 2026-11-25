@@ -143,11 +143,9 @@ function findAssistantIndex(events: RememberSessionEvent[], assistantMessageId: 
 /** 注入块不是用户说的话：source.psyche 由 Host 写入，正文不可伪造。 */
 function isInjectionSource(source: unknown): boolean {
   if (source === null || typeof source !== 'object') return false
-  const record = source as { psyche?: unknown; lingban?: unknown }
-  // M06：旧 Lingban 标记只用于排除历史注入，不属于可信 Psyche 证明。
-  const marker = record.psyche ?? record.lingban
-  if (marker === null || typeof marker !== 'object') return false
-  return (marker as { injection?: unknown }).injection === 'memory-context'
+  const psyche = (source as { psyche?: unknown }).psyche
+  if (psyche === null || typeof psyche !== 'object') return false
+  return (psyche as { injection?: unknown }).injection === 'memory-context'
 }
 
 function extractContentText(content: unknown): string {

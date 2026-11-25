@@ -240,6 +240,21 @@ const qqData = {
   activity: { lastHeartbeatAt: null, lastMessageAt: null, lastSentAt: null },
   logs: [],
 }
+// v29.49：工作区卡的五态数据由宿主现算，这里只按形状回放。
+const qqWorkspace = {
+  ok: true,
+  state: 'registered',
+  label: '已登记',
+  reason: 'QQ 聊天',
+  expectedTitle: 'QQ 聊天',
+  cwd: 'C:\\ws\\QQ 聊天',
+  cwdSource: 'default',
+  workspaceId: 'ws-1',
+  actualTitle: 'QQ 聊天',
+  memberCount: 2,
+  attempt: { at: '2026-11-23T00:00:00.000Z', step: 'created', ok: true },
+  checkedAt: '2026-11-23T00:00:01.000Z',
+}
 const qqNode = find(qq.page.tree, n => n.type?.name === 'QqAdminTab')
 const qqUi = mount(qqNode.type, qqNode.props)
 let qqHandled = 0
@@ -249,6 +264,7 @@ for (let round = 0; round < 3; round += 1) {
   while (qqHandled < qq.requests.length) {
     const request = qq.requests[qqHandled++]
     if (request.url.includes('/qq/diagnostics')) await qq.reply(request, { ok: true, items: [], matched: 0, nextBefore: null })
+    else if (request.url.includes('/qq/workspace')) await qq.reply(request, qqWorkspace)
     else if (request.url.includes('/api/psyche/qq')) await qq.reply(request, qqData)
     else await qq.reply(request, snapshot())
   }
@@ -274,14 +290,30 @@ qqToggleAfterEmbed.props.onClick()
 qqUi.render()
 const qqExpanded = find(qqUi.tree, n => n.props?.['aria-label'] === '高级诊断')
 eq('UI-2c QQ advanced expands on demand', qqExpanded?.props?.['aria-expanded'], 'true')
-// P8-4：QQ 页四段只读视图（运行管理/联系人策略/诊断事件/运行日志）。
-for (const label of ['运行管理', '联系人策略', '诊断事件', '运行日志']) {
+// v29.49：运行管理段有工作区五态卡，读的是宿主现算的状态；编辑入口在内嵌控制中心。
+const wsTexts = collect(qqUi.tree, n => typeof n.type === 'string').map(textOf).filter(text => typeof text === 'string')
+ok('v2949 QQ 工作区卡出现', wsTexts.some(text => text.includes('QQ 工作区')))
+ok('v2949 QQ 工作区卡显示五态标签', wsTexts.some(text => text.includes('已登记')))
+ok('v2949 QQ 工作区卡透传成员数', wsTexts.some(text => text === '2'))
+ok('v2949 QQ 工作区卡标明目录来源', wsTexts.some(text => text.includes('默认（数据目录同级）')))
+ok('v2949 QQ 工作区卡有编辑入口', Boolean(find(qqUi.tree, n => n.type === 'button' && String(textOf(n) ?? '').includes('编辑工作区'))))
+// P8-4：QQ 页五段只读视图（运行管理/联系人策略/模型与推理/诊断事件/运行日志）。
+for (const label of ['运行管理', '联系人策略', '模型与推理', '诊断事件', '运行日志']) {
   ok('P8-4 QQ nav ' + label, Boolean(find(qqUi.tree, n => n.type === 'button' && n.props?.['aria-label'] === label)))
 }
 const contactsNav = find(qqUi.tree, n => n.type === 'button' && n.props?.['aria-label'] === '联系人策略')
 contactsNav.props.onClick()
 qqUi.render()
-ok('P8-4 QQ contacts policy card', collect(qqUi.tree, n => typeof n.type === 'string').map(textOf).some(text => typeof text === 'string' && text.includes('策略由宿主 qq.allowFrom')))
+ok('P8-4 QQ contacts policy card', collect(qqUi.tree, n => typeof n.type === 'string').map(textOf).some(text => typeof text === 'string' && text.includes('这里只读展示生效中的名单')))
+// Q1：只读卡上必须有跳去控制中心改名单的入口，否则用户看得到却改不了。
+ok('Q1 QQ contacts policy 有管理入口', collect(qqUi.tree, n => typeof n.type === 'string').map(textOf).some(text => typeof text === 'string' && text.includes('管理 Owner 与白名单')))
+// v29.48：模型与推理段只放内嵌控制中心，不再重复父页那几张只读卡片。
+const modelNav = find(qqUi.tree, n => n.type === 'button' && n.props?.['aria-label'] === '模型与推理')
+modelNav.props.onClick()
+qqUi.render()
+const modelTexts = collect(qqUi.tree, n => typeof n.type === 'string').map(textOf).filter(text => typeof text === 'string')
+ok('v2948 QQ model 段仍保留控制中心入口', modelTexts.some(text => text.includes('控制中心')))
+ok('v2948 QQ model 段不重复启动顺序卡', !modelTexts.some(text => text.includes('QQ 通道按下面顺序启动')))
 qqUi.unmount()
 
 // UI-4：概览读取失败态（组件级；真实宿主视觉仍 NOT VERIFIED）。

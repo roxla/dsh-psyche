@@ -742,6 +742,35 @@ export interface WriteMeta {
 
 /** 写结果：ok/opId/replayed + 业务载荷（按载荷类型分配，union 也能正确窄化）。 */
 export type WriteResult<T> = T extends unknown ? { ok: true; opId: string; replayed: boolean } & T : never
+
+/**
+ * 私聊采集输入（replySchedules 第二批）。
+ *
+ * 只用于「目标不在允许回复时段，但原本允许采集」的场景：写 Source + 一条 Event，
+ * **不建回复轮、不排队、不发送**。幂等键 = platform + sessionRef + captureKey。
+ */
+export interface PrivateMessageInput {
+  /** 稳定 QQ 号（不是昵称）。 */
+  stableUserId: string
+  /** OneBot 消息 id；`captureKey` 由它构造，重复消息据此幂等。 */
+  messageId: string
+  /** 消息正文；与既有 capture_key 不一致时拒写（E_CAPTURE_CONFLICT）。 */
+  text: string
+  /** 采集时间，缺省当前时间。 */
+  at?: string
+  /** 会话引用，缺省 `qq-private-<stableUserId>`。 */
+  sessionRef?: string
+  /** 发送者展示名，可选，仅用于建档时补名字。 */
+  displayName?: string
+}
+
+/** 私聊采集结果：identity 落在哪条会话、命中了哪条 Source/Event、是否重放。 */
+export interface PrivateMessageResult {
+  sessionRef: string
+  sourceId: string
+  eventId: string | null
+  replayed: boolean
+}
 /** 只读结果：只有 ok/opId + 载荷；opId 为审计用，读路径不要求调用方传。 */
 export type ReadResult<T> = T extends unknown ? { ok: true; opId: string } & T : never
 
@@ -1343,6 +1372,9 @@ export class Core {
     const channel = input.channel ?? 'desktop'
     const sessionRef = input.sessionRef ?? input.session_ref ?? 'psyche:default'
     const captureKey = cleanText(input.captureKey, 200) || null
+    // 第 45 轮外部评审 Q1：轮次身份由调用方给（DSH 侧就是 payload.turn）。
+    // 拿不到就存 NULL —— 摘要侧按「没有轮次身份的历史行」处理，不拿别的字段猜。
+    const turnId = cleanText((input as { turnId?: unknown }).turnId, 120) || null
     // 幂等第一道：写窗口/房间之前就返回，避免重复投递污染活动窗口计数
     if (captureKey) {
       const prior = this.#row<SourceRow>(
@@ -1350,6 +1382,32 @@ export class Core {
         [platform, sessionRef, captureKey],
       )
       if (prior) return this.#replaySource(prior, input)
+    }
+    // 幂等第二道（第二批跨路径反向：独立私聊采集 → Host capture）：
+    // 同一会话里 message_id 就是平台侧的消息身份，captureKey 不同也不该写第二份。
+    // 只对 QQ 生效：别的平台的 messageId 未必是稳定身份（测试夹具里也可能复用），
+    // 扩大范围会把「同 key 不同文本要冲突」这类既有语义冲掉。
+    const messageId = platform === 'qq' ? cleanText(input.messageId, 200) || null : null
+    if (messageId) {
+      const prior = this.#row<SourceRow>(
+        `SELECT * FROM sources WHERE platform = ? AND session_ref = ? AND message_id = ? LIMIT 1`,
+        [platform, sessionRef, messageId],
+      )
+      if (prior) {
+        // 两条路径都各自声明了 captureKey 时，captureKey 才是权威身份：
+        // 这里退回严格重放（正文不一致就按冲突拒绝），否则并发冲突测试会变成「两次都成功」。
+        // 只有「调用方没给 captureKey」时才按 message_id 宽松重放（Host 后写、正文编排不同）。
+        if (captureKey !== null) return this.#replaySource(prior, input)
+        return {
+          sourceId: prior.source_id,
+          windowKey: prior.activity_window_key ?? '',
+          roomId: prior.room_id ?? null,
+          contactId: prior.sender_contact_id ?? null,
+          at: prior.captured_at,
+          sessionRef: prior.session_ref ?? 'psyche:default',
+          replayed: true,
+        }
+      }
     }
     // 先算窗口 key：后面 sources.activity_window_key 直接用它，证据独立性就锚在这里
     const windowKey = this.#windowFor(sessionRef, at)
@@ -1378,8 +1436,8 @@ export class Core {
         `INSERT INTO sources (
            source_id, persona_id, platform, channel, room_id, session_ref, sender_contact_id,
            message_id, reply_to_message_id, mentions, quoted_source_refs, origin, kind, text,
-           asset_sha256, activity_window_key, metadata, captured_at, created_at, capture_key
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           asset_sha256, activity_window_key, metadata, captured_at, created_at, capture_key, turn_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           sourceId,
           PERSONA_ID,
@@ -1407,6 +1465,7 @@ export class Core {
           at,
           nowIso(),
           captureKey,
+          turnId,
         ],
       )
     } catch (err) {
@@ -2511,6 +2570,84 @@ export class Core {
       if(sourceId&&policy&&reasons.length&&accountKey) this.db.run(`INSERT INTO room_triggers(room_id,room_seq,source_id,policy_hash,account_key,transport_id,state,reason,created_ms,last_arrival_ms)
         VALUES(?,?,?,?,?,'qq-onebot',?,?,?,?)`,[roomId,roomSeq,sourceId,policy.policyHash,accountKey,input.schedulingReady===true&&policy.reply.enabled?'armed':'suppressed',input.schedulingReady===true&&policy.reply.enabled?null:'reply_or_proof_disabled',ms,ms])
       return { roomId, roomSeq, sourceId, eventId, retained, replayed: false }
+    }, { source: 'host' })
+  }
+
+  /**
+   * 私聊采集入口（replySchedules 第二批，GPT 第 2 轮裁定 (a)）。
+   *
+   * 与 `ingestGroupMessage` 的区别：不碰 room / 水位 / 触发行，只写一条 Source 与一条
+   * `conversation` 事件。调用方的用法是「时段外仍然采集，但不建回复轮、不排队、不发送」。
+   * 幂等：同一 `platform + sessionRef + captureKey` 再进来，返回既有 Source/Event（不新增
+   * Event）；正文变了解释为「同一条消息内容冲突」，由 `#replaySource` 抛 E_CAPTURE_CONFLICT。
+   */
+  async ingestPrivateMessage(input: PrivateMessageInput): Promise<WriteResult<PrivateMessageResult>> {
+    return this.#write('psyche_private_intake', input, ({ opId }) => {
+      const qqId = (value: unknown): value is string => typeof value === 'string' && /^[1-9][0-9]{0,19}$/.test(value)
+      if (!qqId(input.stableUserId)) throw invalid('私聊对象身份非法')
+      if (typeof input.messageId !== 'string' || !/^[A-Za-z0-9_:-]{1,120}$/.test(input.messageId)) {
+        throw invalid('私聊消息身份缺失或非法')
+      }
+      if (typeof input.text !== 'string' || input.text.length > 20000) throw invalid('私聊消息正文长度非法')
+      const at = input.at ?? nowIso()
+      if (!Number.isFinite(Date.parse(at))) throw invalid('私聊消息采集时间非法')
+      const sessionRef = input.sessionRef ?? `qq-private-${input.stableUserId}`
+      if (typeof sessionRef !== 'string' || sessionRef.length === 0 || sessionRef.length > 200) {
+        throw invalid('私聊会话引用非法')
+      }
+      const captureKey = `qq-private:${input.stableUserId}:message:${input.messageId}`
+      // 跨路径去重（GPT 第 3 轮 ③ 锁一）：Host capture 与独立采集可能对同一条 QQ 消息各写
+      // 一份 Source，captureKey 只在独立路径内部唯一。身份统一按
+      // (platform, session_ref, message_id) 认定：命中既有行就重放，不再写第二条。
+      const byMessageId = this.#row<SourceRow>(
+        `SELECT * FROM sources WHERE persona_id = ? AND platform = 'qq' AND session_ref = ? AND message_id = ? ORDER BY rowid LIMIT 1`,
+        [PERSONA_ID, sessionRef, input.messageId],
+      )
+      const prior = byMessageId ?? this.#row<SourceRow>(
+        `SELECT * FROM sources WHERE persona_id = ? AND platform = 'qq' AND session_ref = ? AND capture_key = ? LIMIT 1`,
+        [PERSONA_ID, sessionRef, captureKey],
+      )
+      if (prior) {
+        // 同一条消息只记一次：重放不新增事件。
+        // 只有「同一 captureKey 再进来」才校验正文一致性（同身份不同内容是错误）；
+        // 按 message_id 命中 Host capture 的行时，正文由 Host 侧编排，不做逐字比对。
+        if (prior.capture_key === captureKey) {
+          this.#replaySource(prior, { text: input.text, origin: 'user', kind: 'message' })
+        }
+        const link = this.#row<{ event_id: string }>(
+          'SELECT event_id FROM event_sources WHERE source_id = ? ORDER BY rowid LIMIT 1',
+          [prior.source_id],
+        )
+        return { sessionRef, sourceId: prior.source_id, eventId: link?.event_id ?? null, replayed: true }
+      }
+      const contactId = this.#resolveContactSync({
+        platform: 'qq',
+        stableUserId: input.stableUserId,
+        displayName: input.displayName ?? null,
+      })
+      const source = this.#insertSource({
+        platform: 'qq',
+        channel: 'private',
+        sessionRef,
+        senderContactId: contactId,
+        messageId: input.messageId,
+        origin: 'user',
+        kind: 'message',
+        text: input.text,
+        captureKey,
+        at,
+      })
+      const eventId = this.#insertEvent({
+        kind: 'interaction',
+        type: 'conversation',
+        text: '私聊消息已采集',
+        at,
+        sessionRef,
+        subjectRefs: [contactId],
+        opId,
+        sourceRows: [this.#row<SourceRow>('SELECT * FROM sources WHERE source_id = ?', [source.sourceId])!],
+      })
+      return { sessionRef, sourceId: source.sourceId, eventId, replayed: false }
     }, { source: 'host' })
   }
 

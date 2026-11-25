@@ -94,7 +94,7 @@ const normalReport = inspectIntegrity(normal.dir)
 check('正常库 status=ok', normalReport.status === 'ok', normalReport.issues)
 check('正常库零失败', normalReport.summary.failed === 0)
 check('正常库 readOnly 为 true', normalReport.readOnly === true)
-check('正常库 schemaVersion 是 31', normalReport.schemaVersion === 31)
+check('正常库 schemaVersion 是 42', normalReport.schemaVersion === 42)
 check('正常库有 11 个分组', normalReport.groups.length >= 9, normalReport.groups.map((g) => g.name))
 
 // ── 2. 外键孤儿 ─────────────────────────────────────────────

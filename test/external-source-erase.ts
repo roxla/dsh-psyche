@@ -98,7 +98,7 @@ async function scenario(driver: string): Promise<void> {
 
   logicalDelete(db, sourceId)
   eq(`${driver}: logical deleted`, eraseStatusOf(db, sourceId), 'logical_deleted')
-  throws(`${driver}: bad owner`, () => requestErase(db, { sourceId, by: 'user:test' }), 'E_OWNER_UNVERIFIED')
+  throws(`${driver}: bad owner`, () => requestErase(db, { sourceId, by: 'user:roxla' }), 'E_OWNER_UNVERIFIED')
   const requested = requestErase(db, { sourceId, by: OWNER })
   eq(`${driver}: pending`, eraseStatusOf(db, sourceId), 'erase_pending')
   eq(`${driver}: request event`, requested.action, 'erase_request')
