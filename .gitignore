@@ -50,3 +50,6 @@ dsh-psyche-DEV.md
 dsh-lingban-DEV.md
 
 docs/
+
+# ── 一次性验收探针（本地保留） ──────────────────────────────────────
+tools/b3-3-*.mjs
