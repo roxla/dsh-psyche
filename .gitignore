@@ -43,3 +43,8 @@ cordis.patch.local.yml
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ── 内部开发文档（不上传） ──────────────────────────────────────────
+AGENTS.md
+dsh-psyche-DEV.md
+dsh-lingban-DEV.md
